@@ -37,7 +37,7 @@ bot_state = {
     "current_balance": 1000.0,
     
     "current_price": 0.0,
-    "status_message": "Binance Spot Engine සූදානම්ව පවතී...",
+    "status_message": "Fast Scalp Spot DCA Engine සූදානම්ව පවතී...",
     "wins": 0,
     "losses": 0,
     "total_trades": 0,
@@ -60,10 +60,10 @@ bot_state = {
     "ml_signal": "NEUTRAL",
     "ml_confidence": 0.0,
     "ai_decision": "WAITING",
-    "ai_reasoning": "Binance Spot DCA Engine සූදානම්ව පවතී...",
+    "ai_reasoning": "Fast Scalp DCA Engine සූදානම්ව පවතී...",
     "db_total_trades": 0,
     "db_win_rate": 0.0,
-    "auto_tuned_ml_filter": 55.0
+    "auto_tuned_ml_filter": 50.0
 }
 
 active_position = None  
@@ -170,10 +170,10 @@ def get_db_stats_and_dynamic_filter():
         total_trades = total_count if total_count else 0
         historical_win_rate = round((total_wins / total_trades * 100), 1) if total_trades > 0 else 0.0
 
-        min_ml_threshold = 55.0  
+        min_ml_threshold = 50.0  
         return total_trades, historical_win_rate, min_ml_threshold
     except Exception as e:
-        return 0, 0.0, 55.0
+        return 0, 0.0, 50.0
 
 PUBLIC_BINANCE_URLS = [
     "https://data-api.binance.vision",
@@ -236,7 +236,7 @@ def analyze_trade_with_groq_ai(signal, price, rsi, macd, ema20, ema200, ml_conf,
     current_time = time.time()
     
     if (current_time - last_groq_call_time) < GROQ_COOLDOWN_SECONDS:
-        return True, "Groq Limit Protection: Spot Base Layer approved."
+        return True, "Groq Limit Protection: Fast Scalp Base Layer approved."
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -266,7 +266,7 @@ def analyze_trade_with_groq_ai(signal, price, rsi, macd, ema20, ema200, ml_conf,
             if json_match:
                 parsed = json.loads(json_match.group(0))
                 decision = parsed.get("decision", "REJECT") == "CONFIRM"
-                reason = parsed.get("reason", "AI Approved Spot Base Entry")
+                reason = parsed.get("reason", "AI Approved Fast Scalp Base Entry")
                 return decision, reason
         return True, "Groq AI bypass due to API limit/timeout."
     except Exception as e:
@@ -296,7 +296,7 @@ def train_and_predict_ml(df):
         
         prob_up = probs[1] * 100
         
-        if prob_up >= 55.0:
+        if prob_up >= 50.0:
             return "LONG", round(prob_up, 1)
         else:
             return "NEUTRAL", round(prob_up, 1)
@@ -387,7 +387,8 @@ def recalculate_spot_dca_levels(layers):
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
-    tp_price = round(avg_price * 1.012, 4)
+    # Fast Scalp Take Profit Target: 0.85% above avg entry (Quick execution)
+    tp_price = round(avg_price * 1.0085, 4)
     lowest_price = min(l["price"] for l in layers)
     sl_price = round(lowest_price * 0.980, 4) 
 
@@ -438,7 +439,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 with state_lock:
                     bot_state["current_balance"] = float(usdt_asset["free"])
 
-    # 1. SPOT SMART DCA + TRAILING PROFIT GUARD
+    # 1. FAST SCALP SPOT DCA + TRAILING PROFIT GUARD
     if active_position:
         layers = active_position["layers"]
         avg_price = active_position["avg_price"]
@@ -447,10 +448,10 @@ def process_bot_logic(symbol, mode, risk_pct):
         sl_price = active_position["sl_price"]
         last_layer_price = layers[-1]["price"]
 
-        # Trailing Profit Guard (+0.4% activation)
-        if current_price >= avg_price * 1.0040:
-            min_profit_sl = round(avg_price * 1.0025, 4)
-            potential_trailing_sl = round(current_price - (0.8 * atr_val), 4)
+        # Fast Trailing Profit Guard (+0.3% activation)
+        if current_price >= avg_price * 1.0030:
+            min_profit_sl = round(avg_price * 1.0018, 4) # Lock in net profit above fee
+            potential_trailing_sl = round(current_price - (0.6 * atr_val), 4)
             new_sl = max(min_profit_sl, potential_trailing_sl)
 
             if new_sl > sl_price:
@@ -458,7 +459,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 active_position["trailing_tp_active"] = True
                 sl_price = new_sl
 
-        layer_step_pct = max(0.008, (1.2 * atr_val) / current_price) 
+        layer_step_pct = max(0.007, (1.0 * atr_val) / current_price) 
 
         can_add_layer = False
         if len(layers) < 3 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
@@ -535,29 +536,28 @@ def process_bot_logic(symbol, mode, risk_pct):
             active_position = None
             last_trade_time = current_time
 
-    # 2. SPOT BASE ENTRY SIGNAL SEARCH
+    # 2. FAST FLEXIBLE SPOT BASE ENTRY SIGNAL SEARCH
     else:
-        cooldown_period = 30  
+        cooldown_period = 10  # Fast 10-second cooldown for maximum daily frequency
         if (current_time - last_trade_time) < cooldown_period:
             rem_sec = int(cooldown_period - (current_time - last_trade_time))
             with state_lock:
                 bot_state["status_message"] = f"විරාමය (Cooldown): තව තත්පර {rem_sec}..."
         else:
             with state_lock:
-                bot_state["status_message"] = f"Spot Base Entry Signal (ML Filter: {min_ml_filter}%) නිරීක්ෂණය වේ..."
+                bot_state["status_message"] = f"Fast Scalp Base Entry Signal (ML Filter: {min_ml_filter}%) නිරීක්ෂණය වේ..."
             
             tech_signal = None
             macd_diff = ind["macd"] - ind["macd_signal"]
 
-            if (current_price > ind["ema_200"] and 
-                ind["ema_20"] > ind["ema_50"] and 
-                ind["rsi"] >= 35 and ind["rsi"] <= 70 and 
-                macd_diff > 0):
+            # Flexible High-Frequency Entry Trigger
+            if ((ind["ema_20"] > ind["ema_50"] or macd_diff > 0) and 
+                (30 <= ind["rsi"] <= 72)):
                 tech_signal = "LONG"
 
             if tech_signal and tech_signal == ml_signal and ml_conf >= min_ml_filter:
                 with state_lock:
-                    bot_state["status_message"] = f"Groq AI හරහා Spot Base Entry එක තහවුරු කරමින්..."
+                    bot_state["status_message"] = f"Groq AI හරහා Fast Scalp Base Entry එක තහවුරු කරමින්..."
                 
                 ai_approved, ai_reason = analyze_trade_with_groq_ai(
                     tech_signal, current_price, ind["rsi"], 
@@ -662,16 +662,15 @@ def start_bot():
             bot_state["current_balance"] = init_bal
             
         bot_state["is_running"] = True
-        bot_state["status_message"] = f"Binance Spot DCA AI Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
+        bot_state["status_message"] = f"Binance Spot Fast Scalp AI Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
         
-    return jsonify({"status": "success", "message": "Spot Bot සාර්ථකව ආරම්භ විය!"})
+    return jsonify({"status": "success", "message": "Fast Scalp Spot Bot සාර්ථකව ආරම්භ විය!"})
 
 @app.route("/api/reset_demo", methods=["POST"])
 def reset_demo():
     data = request.json
     init_bal = float(data.get("start_balance", 1000.0))
     
-    # CLEAR DATABASE TRADES ONLY ON EXPLICIT RESET DEMO CLICK
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
