@@ -25,64 +25,6 @@ GROQ_COOLDOWN_SECONDS = 45
 
 DB_FILE = "bot_memory.db"
 
-def init_db():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS trade_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT,
-                symbol TEXT,
-                side TEXT,
-                avg_price REAL,
-                layers_count INTEGER,
-                tp REAL,
-                sl REAL,
-                rsi REAL,
-                macd REAL,
-                ml_conf REAL,
-                pnl REAL,
-                outcome TEXT
-            )
-        ''')
-        conn.commit()
-        conn.close()
-        print("[DATABASE] SQLite Memory Engine initialized successfully!")
-    except Exception as e:
-        print(f"[DATABASE ERROR] Could not initialize DB: {e}")
-
-init_db()
-
-def save_trade_to_db(timestamp, symbol, side, avg_price, layers_count, tp, sl, rsi, macd, ml_conf, pnl, outcome):
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO trade_history (timestamp, symbol, side, avg_price, layers_count, tp, sl, rsi, macd, ml_conf, pnl, outcome)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (timestamp, symbol, side, avg_price, layers_count, tp, sl, rsi, macd, ml_conf, pnl, outcome))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"[DATABASE ERROR] Could not save trade: {e}")
-
-def get_db_stats_and_dynamic_filter():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) FROM trade_history")
-        total_count, total_wins = cursor.fetchone()
-        conn.close()
-
-        total_trades = total_count if total_count else 0
-        historical_win_rate = round((total_wins / total_trades * 100), 1) if total_trades > 0 else 0.0
-
-        min_ml_threshold = 55.0  
-        return total_trades, historical_win_rate, min_ml_threshold
-    except Exception as e:
-        return 0, 0.0, 55.0
-
 bot_state = {
     "is_running": False,
     "api_token": "",      
@@ -129,7 +71,110 @@ last_trade_time = 0
 state_lock = threading.Lock()
 worker_thread_started = False
 
-# MULTI-FALLBACK PUBLIC ENDPOINTS (UNBLOCKED PUBLIC MARKET DATA)
+def init_db():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trade_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                symbol TEXT,
+                side TEXT,
+                avg_price REAL,
+                layers_count INTEGER,
+                tp REAL,
+                sl REAL,
+                rsi REAL,
+                macd REAL,
+                ml_conf REAL,
+                pnl REAL,
+                outcome TEXT
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        print("[DATABASE] SQLite Memory Engine initialized successfully!")
+    except Exception as e:
+        print(f"[DATABASE ERROR] Could not initialize DB: {e}")
+
+def load_db_history():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT timestamp, symbol, side, avg_price, layers_count, tp, sl, pnl, outcome FROM trade_history ORDER BY id DESC LIMIT 50")
+        rows = cursor.fetchall()
+        
+        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), SUM(pnl) FROM trade_history")
+        total_count, total_wins, total_pnl = cursor.fetchone()
+        conn.close()
+
+        history_trades = []
+        for row in rows:
+            timestamp, symbol, side, avg_price, layers_count, tp, sl, pnl, outcome = row
+            history_trades.append({
+                "time": timestamp,
+                "type": f"{side} ({layers_count} Layers)",
+                "price": avg_price,
+                "tp": tp,
+                "sl": sl,
+                "pnl": pnl,
+                "status": outcome
+            })
+
+        tot_trades = total_count if total_count else 0
+        wins_count = total_wins if total_wins else 0
+        losses_count = (tot_trades - wins_count) if tot_trades >= wins_count else 0
+        acc = round((wins_count / tot_trades * 100), 1) if tot_trades > 0 else 0.0
+        tot_pnl = round(total_pnl, 2) if total_pnl else 0.0
+
+        with state_lock:
+            bot_state["active_trades"] = history_trades
+            bot_state["total_trades"] = tot_trades
+            bot_state["wins"] = wins_count
+            bot_state["losses"] = losses_count
+            bot_state["accuracy"] = acc
+            bot_state["current_profit"] = tot_pnl
+            bot_state["db_total_trades"] = tot_trades
+            bot_state["db_win_rate"] = acc
+
+        print(f"[DATABASE] Auto-Loaded {len(history_trades)} historical trades into memory!")
+    except Exception as e:
+        print(f"[DATABASE ERROR] Could not load DB history: {e}")
+
+init_db()
+load_db_history()
+
+def save_trade_to_db(timestamp, symbol, side, avg_price, layers_count, tp, sl, rsi, macd, ml_conf, pnl, outcome):
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO trade_history (timestamp, symbol, side, avg_price, layers_count, tp, sl, rsi, macd, ml_conf, pnl, outcome)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (timestamp, symbol, side, avg_price, layers_count, tp, sl, rsi, macd, ml_conf, pnl, outcome))
+        conn.commit()
+        conn.close()
+        load_db_history()
+    except Exception as e:
+        print(f"[DATABASE ERROR] Could not save trade: {e}")
+
+def get_db_stats_and_dynamic_filter():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) FROM trade_history")
+        total_count, total_wins = cursor.fetchone()
+        conn.close()
+
+        total_trades = total_count if total_count else 0
+        historical_win_rate = round((total_wins / total_trades * 100), 1) if total_trades > 0 else 0.0
+
+        min_ml_threshold = 55.0  
+        return total_trades, historical_win_rate, min_ml_threshold
+    except Exception as e:
+        return 0, 0.0, 55.0
+
 PUBLIC_BINANCE_URLS = [
     "https://data-api.binance.vision",
     "https://api.binance.com",
@@ -487,26 +532,6 @@ def process_bot_logic(symbol, mode, risk_pct):
 
             save_trade_to_db(active_position["entry_time"], symbol, "SPOT LONG", avg_price, len(layers), tp_price, sl_price, active_position["rsi"], active_position["macd"], active_position["ml_conf"], net_pnl, outcome)
 
-            with state_lock:
-                if net_pnl > 0:
-                    bot_state["wins"] += 1
-                else:
-                    bot_state["losses"] += 1
-                
-                bot_state["total_trades"] += 1
-                tot = bot_state["total_trades"]
-                bot_state["accuracy"] = round((bot_state["wins"] / tot) * 100, 1)
-                bot_state["current_profit"] += net_pnl
-                
-                if mode == "paper":
-                    bot_state["current_balance"] += net_pnl
-                
-                time_str = time.strftime('%H:%M:%S', time.localtime())
-                bot_state["active_trades"].insert(0, {
-                    "time": time_str, "type": f"SPOT LONG ({len(layers)} Layers)", "price": avg_price,
-                    "tp": tp_price, "sl": sl_price, "pnl": net_pnl, "status": outcome
-                })
-
             active_position = None
             last_trade_time = current_time
 
@@ -635,12 +660,6 @@ def start_bot():
             init_bal = float(data.get("start_balance", 1000.0))
             bot_state["virtual_balance"] = init_bal
             bot_state["current_balance"] = init_bal
-            bot_state["wins"] = 0
-            bot_state["losses"] = 0
-            bot_state["total_trades"] = 0
-            bot_state["accuracy"] = 0.0
-            bot_state["current_profit"] = 0.0
-            bot_state["active_trades"] = []
             
         bot_state["is_running"] = True
         bot_state["status_message"] = f"Binance Spot DCA AI Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
@@ -651,6 +670,18 @@ def start_bot():
 def reset_demo():
     data = request.json
     init_bal = float(data.get("start_balance", 1000.0))
+    
+    # CLEAR DATABASE TRADES ONLY ON EXPLICIT RESET DEMO CLICK
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM trade_history")
+        conn.commit()
+        conn.close()
+        print("[DATABASE] Trade history cleared on explicit Reset Demo!")
+    except Exception as e:
+        print(f"[DATABASE ERROR] Could not clear DB on reset: {e}")
+
     with state_lock:
         bot_state["virtual_balance"] = init_bal
         bot_state["current_balance"] = init_bal
@@ -660,8 +691,11 @@ def reset_demo():
         bot_state["accuracy"] = 0.0
         bot_state["current_profit"] = 0.0
         bot_state["active_trades"] = []
+        bot_state["db_total_trades"] = 0
+        bot_state["db_win_rate"] = 0.0
         bot_state["status_message"] = f"Demo Balance එක සාර්ථකව ${init_bal} ට Reset විය."
-    return jsonify({"status": "success", "message": f"Demo Balance එක සාර්ථකව ${init_bal} ට Reset විය!"})
+
+    return jsonify({"status": "success", "message": f"Demo Balance සහ Trade History එක සාර්ථකව ${init_bal} ට Reset විය!"})
 
 @app.route("/api/stop", methods=["POST"])
 def stop_bot():
