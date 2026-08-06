@@ -37,7 +37,7 @@ bot_state = {
     "current_balance": 1000.0,
     
     "current_price": 0.0,
-    "status_message": "Fast Scalp Spot DCA Engine සූදානම්ව පවතී...",
+    "status_message": "Binance Spot Fast Scalp Engine සූදානම්ව පවතී...",
     "wins": 0,
     "losses": 0,
     "total_trades": 0,
@@ -60,7 +60,7 @@ bot_state = {
     "ml_signal": "NEUTRAL",
     "ml_confidence": 0.0,
     "ai_decision": "WAITING",
-    "ai_reasoning": "Fast Scalp DCA Engine සූදානම්ව පවතී...",
+    "ai_reasoning": "Binance Spot DCA Engine සූදානම්ව පවතී...",
     "db_total_trades": 0,
     "db_win_rate": 0.0,
     "auto_tuned_ml_filter": 50.0
@@ -175,6 +175,7 @@ def get_db_stats_and_dynamic_filter():
     except Exception as e:
         return 0, 0.0, 50.0
 
+# UNBLOCKED PUBLIC MARKET DATA ENDPOINTS
 PUBLIC_BINANCE_URLS = [
     "https://data-api.binance.vision",
     "https://api.binance.com",
@@ -449,7 +450,7 @@ def process_bot_logic(symbol, mode, risk_pct):
 
         # Trailing Profit Guard (+0.35% activation, +0.28% floor to ALWAYS guarantee NET profit after fees)
         if current_price >= avg_price * 1.0035:
-            min_profit_sl = round(avg_price * 1.0028, 4) # Guaranteed Net Profit Floor above 0.20% fee
+            min_profit_sl = round(avg_price * 1.0028, 4)
             potential_trailing_sl = round(current_price - (0.6 * atr_val), 4)
             new_sl = max(min_profit_sl, potential_trailing_sl)
 
@@ -641,6 +642,16 @@ def index():
             return f.read(), 200, {'Content-Type': 'text/html; charset=utf-8'}
     except FileNotFoundError:
         return "Error: index.html ගොනුව හමුවූයේ නැත!", 404
+
+@app.route("/api/ip")
+def get_server_ip():
+    try:
+        res = requests.get("https://api.ipify.org?format=json", timeout=4)
+        if res.status_code == 200:
+            return jsonify(res.json())
+        return jsonify({"ip": "Unavailable", "status": res.status_code})
+    except Exception as e:
+        return jsonify({"ip": "Unavailable", "error": str(e)})
 
 @app.route("/api/start", methods=["POST"])
 def start_bot():
