@@ -26,7 +26,7 @@ GROQ_COOLDOWN_SECONDS = 45
 DB_FILE = "bot_memory.db"
 
 bot_state = {
-    "is_running": False,
+    "is_running": True,   
     "api_token": "",      
     "api_secret": "",     
     "mode": "paper",       
@@ -37,7 +37,7 @@ bot_state = {
     "current_balance": 1000.0,
     
     "current_price": 0.0,
-    "status_message": "Binance Spot Fast Scalp Engine සූදානම්ව පවතී...",
+    "status_message": "Binance Spot Fast Scalp AI Engine සජීවීව ක්‍රියාත්මක වේ...",
     "wins": 0,
     "losses": 0,
     "total_trades": 0,
@@ -60,7 +60,7 @@ bot_state = {
     "ml_signal": "NEUTRAL",
     "ml_confidence": 0.0,
     "ai_decision": "WAITING",
-    "ai_reasoning": "Binance Spot DCA Engine සූදානම්ව පවතී...",
+    "ai_reasoning": "Fast Scalp DCA Engine සූදානම්ව පවතී...",
     "db_total_trades": 0,
     "db_win_rate": 0.0,
     "auto_tuned_ml_filter": 50.0
@@ -102,7 +102,7 @@ def load_db_history():
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        cursor.execute("SELECT timestamp, symbol, side, avg_price, layers_count, tp, sl, pnl, outcome FROM trade_history ORDER BY id DESC LIMIT 50")
+        cursor.execute("SELECT timestamp, symbol, side, avg_price, layers_count, tp, sl, pnl, outcome FROM trade_history ORDER BY id DESC LIMIT 100")
         rows = cursor.fetchall()
         
         cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), SUM(pnl) FROM trade_history")
@@ -175,7 +175,6 @@ def get_db_stats_and_dynamic_filter():
     except Exception as e:
         return 0, 0.0, 50.0
 
-# UNBLOCKED PUBLIC MARKET DATA ENDPOINTS
 PUBLIC_BINANCE_URLS = [
     "https://data-api.binance.vision",
     "https://api.binance.com",
@@ -448,9 +447,9 @@ def process_bot_logic(symbol, mode, risk_pct):
         sl_price = active_position["sl_price"]
         last_layer_price = layers[-1]["price"]
 
-        # Trailing Profit Guard (+0.35% activation, +0.28% floor to ALWAYS guarantee NET profit after fees)
+        # Fast Trailing Profit Guard (+0.35% activation, +0.28% floor to ALWAYS guarantee NET profit after fees)
         if current_price >= avg_price * 1.0035:
-            min_profit_sl = round(avg_price * 1.0028, 4)
+            min_profit_sl = round(avg_price * 1.0028, 4) 
             potential_trailing_sl = round(current_price - (0.6 * atr_val), 4)
             new_sl = max(min_profit_sl, potential_trailing_sl)
 
@@ -519,7 +518,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             est_binance_spot_fee = (notional_val * 2) * 0.0010 
             net_pnl = round(gross_pnl - est_binance_spot_fee, 2)
 
-            if active_position.get("trailing_tp_active", False):
+            if active_position.get("trailing_tp_active", False) or net_pnl >= 0:
                 outcome = f"ජයග්‍රහණය (Trailing Profit Hit 🔥 - {len(layers)} Layers)"
             elif net_pnl >= 0:
                 outcome = f"ජයග්‍රහණය (Spot DCA Target Hit - {len(layers)} Layers)"
@@ -653,6 +652,20 @@ def get_server_ip():
     except Exception as e:
         return jsonify({"ip": "Unavailable", "error": str(e)})
 
+@app.route("/api/export_csv")
+def export_csv():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        df = pd.read_sql_query("SELECT timestamp as Time, symbol as Symbol, side as Type, avg_price as Avg_Price, layers_count as Layers, tp as Take_Profit, sl as Stop_Loss, pnl as Net_PnL_USD, outcome as Status FROM trade_history ORDER BY id DESC", conn)
+        conn.close()
+        csv_data = df.to_csv(index=False)
+        return csv_data, 200, {
+            'Content-Type': 'text/csv',
+            'Content-Disposition': 'attachment; filename=spot_bot_trade_history.csv'
+        }
+    except Exception as e:
+        return str(e), 500
+
 @app.route("/api/start", methods=["POST"])
 def start_bot():
     start_worker_safely()
@@ -665,7 +678,7 @@ def start_bot():
         bot_state["leverage"] = 1 
         bot_state["risk_pct"] = float(data.get("risk_pct", 15.0))
         
-        if bot_state["mode"] == "paper" and not bot_state["is_running"]:
+        if bot_state["mode"] == "paper":
             init_bal = float(data.get("start_balance", 1000.0))
             bot_state["virtual_balance"] = init_bal
             bot_state["current_balance"] = init_bal
