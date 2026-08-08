@@ -36,6 +36,7 @@
         .btn-stop { background-color: var(--accent-red); color: white; }
         .btn-stop:hover { background-color: #dc2626; }
         .btn-reset { background-color: #3b82f6; color: white; }
+        .btn-export { background-color: #a855f7; color: white; padding: 6px 12px; font-size: 12px; border-radius: 6px; }
         
         .metrics-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 15px; }
         .metric-box { background: var(--bg-dark); padding: 10px; border-radius: 8px; border: 1px solid var(--border-color); text-align: center; }
@@ -89,10 +90,10 @@
                 <div class="form-group" id="demo_balance_group">
                     <label>Virtual Demo Balance ($):</label>
                     <select id="start_balance">
-                        <option value="100" selected>$100.00 USDT</option>
+                        <option value="100">$100.00 USDT</option>
                         <option value="200">$200.00 USDT</option>
                         <option value="500">$500.00 USDT</option>
-                        <option value="1000">$1000.00 USDT</option>
+                        <option value="1000" selected>$1000.00 USDT</option>
                     </select>
                 </div>
 
@@ -136,13 +137,13 @@
                         <span id="ml_signal_badge" style="color:#a855f7;">NEUTRAL</span>
                     </div>
                     <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 6px;">
-                        ML Score: <strong id="ml_conf_text" style="color:white;">0%</strong> | Filter: <strong id="auto_filter_text" style="color:#f59e0b;">55% (Auto)</strong>
+                        ML Score: <strong id="ml_conf_text" style="color:white;">0%</strong> | Filter: <strong id="auto_filter_text" style="color:#f59e0b;">50% (Auto)</strong>
                     </div>
                     <div style="font-size: 11px; color: #38bdf8; margin-bottom: 6px;">
                         DB History: <strong id="db_trades_text">0 Trades</strong> | Win Rate: <strong id="db_winrate_text" style="color:#22c55e;">0%</strong>
                     </div>
                     <div id="ai_reasoning_text" style="font-size: 11px; color: #d8b4fe; font-style: italic;">
-                        Binance Spot DCA Engine සූදානම්ව පවතී...
+                        Fast Scalp DCA Engine සූදානම්ව පවතී...
                     </div>
                 </div>
 
@@ -180,8 +181,11 @@
             </div>
 
             <div class="card">
-                <h2>සජීවී Spot DCA Trades වාර්තාව (Running & Closed Trades)</h2>
-                <div style="overflow-x: auto; max-height: 280px;">
+                <h2>
+                    <span>සජීවී Spot DCA Trades වාර්තාව</span>
+                    <button class="btn-export" onclick="window.location.href='/api/export_csv'">📥 Download History (CSV)</button>
+                </h2>
+                <div style="overflow-x: auto; max-height: 320px;">
                     <table class="trades-table">
                         <thead>
                             <tr>
@@ -306,7 +310,7 @@
                 
                 document.getElementById('ml_signal_badge').innerText = data.ml_signal || "NEUTRAL";
                 document.getElementById('ml_conf_text').innerText = `${data.ml_confidence || 0}%`;
-                document.getElementById('auto_filter_text').innerText = `${data.auto_tuned_ml_filter || 55}% (Auto)`;
+                document.getElementById('auto_filter_text').innerText = `${data.auto_tuned_ml_filter || 50}% (Auto)`;
                 document.getElementById('db_trades_text').innerText = `${data.db_total_trades || 0} Trades`;
                 document.getElementById('db_winrate_text').innerText = `${data.db_win_rate || 0}%`;
                 document.getElementById('ai_reasoning_text').innerText = data.ai_reasoning || "AI සාමාන්‍ය තත්ත්වයෙන් පවතී.";
@@ -376,6 +380,7 @@
                 if (data.active_trades && data.active_trades.length > 0) {
                     data.active_trades.forEach(t => {
                         let badgeClass = 'color:#22c55e;font-weight:bold;';
+                        if (t.pnl < 0) badgeClass = 'color:#ef4444;font-weight:bold;';
                         html += `<tr>
                             <td>${t.time}</td>
                             <td><span style="${badgeClass}">${t.type}</span></td>
