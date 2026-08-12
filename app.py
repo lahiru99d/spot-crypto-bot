@@ -37,7 +37,7 @@ bot_state = {
     "current_balance": 1000.0,
     
     "current_price": 0.0,
-    "status_message": "Binance Spot Golden DCA Engine සජීවීව ක්‍රියාත්මක වේ...",
+    "status_message": "Tight Loss + Step Trailing Spot DCA Engine සජීවීව ක්‍රියාත්මක වේ...",
     "wins": 0,
     "losses": 0,
     "total_trades": 0,
@@ -60,7 +60,7 @@ bot_state = {
     "ml_signal": "NEUTRAL",
     "ml_confidence": 0.0,
     "ai_decision": "WAITING",
-    "ai_reasoning": "Golden DCA Engine සූදානම්ව පවතී...",
+    "ai_reasoning": "Step Trailing DCA Engine සූදානම්ව පවතී...",
     "db_total_trades": 0,
     "db_win_rate": 0.0,
     "auto_tuned_ml_filter": 50.0
@@ -116,7 +116,7 @@ def load_db_history():
                 "time": timestamp,
                 "type": f"{side} ({layers_count} Layers)",
                 "price": avg_price,
-                "tp": tp,
+                "tp": "Max Trailing 🔥",
                 "sl": sl,
                 "pnl": pnl,
                 "status": outcome
@@ -236,7 +236,7 @@ def analyze_trade_with_groq_ai(signal, price, rsi, macd, ema20, ema200, ml_conf,
     current_time = time.time()
     
     if (current_time - last_groq_call_time) < GROQ_COOLDOWN_SECONDS:
-        return True, "Groq Limit Protection: Golden DCA Base Layer approved."
+        return True, "Groq Limit Protection: Step Trailing Base Layer approved."
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -266,7 +266,7 @@ def analyze_trade_with_groq_ai(signal, price, rsi, macd, ema20, ema200, ml_conf,
             if json_match:
                 parsed = json.loads(json_match.group(0))
                 decision = parsed.get("decision", "REJECT") == "CONFIRM"
-                reason = parsed.get("reason", "AI Approved Golden DCA Base Entry")
+                reason = parsed.get("reason", "AI Approved Step Trailing Base Entry")
                 return decision, reason
         return True, "Groq AI bypass due to API limit/timeout."
     except Exception as e:
@@ -387,10 +387,11 @@ def recalculate_spot_dca_levels(layers):
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
-    # Golden Balance Take Profit Target: 1.2% above avg entry (Closes in 20-45 mins with $2.00 - $6.00+ Net Profit)
-    tp_price = round(avg_price * 1.012, 4)
+    # No hard upper TP ceiling (Unlimited Trailing Ride)
+    tp_price = 999999.0 
     lowest_price = min(l["price"] for l in layers)
-    sl_price = round(lowest_price * 0.985, 4) # Emergency SL (-1.5%)
+    # Tight Emergency SL: Only 0.8% below lowest layer (Keeps max loss tiny ~$4.50 - $6.00)
+    sl_price = round(lowest_price * 0.992, 4) 
 
     return round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), tp_price, sl_price
 
@@ -439,19 +440,18 @@ def process_bot_logic(symbol, mode, risk_pct):
                 with state_lock:
                     bot_state["current_balance"] = float(usdt_asset["free"])
 
-    # 1. GOLDEN BALANCE SPOT DCA + TRAILING PROFIT GUARD
+    # 1. STEP-BY-STEP TRAILING SPOT DCA ENGINE
     if active_position:
         layers = active_position["layers"]
         avg_price = active_position["avg_price"]
         total_qty = active_position["total_qty"]
-        tp_price = active_position["tp_price"]
         sl_price = active_position["sl_price"]
         last_layer_price = layers[-1]["price"]
 
-        # Trailing Profit Guard (+0.50% activation, +0.35% floor to guarantee $0.60+ NET profit minimum)
-        if current_price >= avg_price * 1.0050:
-            min_profit_sl = round(avg_price * 1.0035, 4) 
-            potential_trailing_sl = round(current_price - (0.6 * atr_val), 4)
+        # Step-by-Step Micro Trailing Guard (+0.25% activation, follows price closely with 0.4*ATR)
+        if current_price >= avg_price * 1.0025:
+            min_profit_sl = round(avg_price * 1.0018, 4) # Guaranteed net profit floor
+            potential_trailing_sl = round(current_price - (0.4 * atr_val), 4)
             new_sl = max(min_profit_sl, potential_trailing_sl)
 
             if new_sl > sl_price:
@@ -459,7 +459,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 active_position["trailing_tp_active"] = True
                 sl_price = new_sl
 
-        layer_step_pct = max(0.008, (1.0 * atr_val) / current_price) 
+        layer_step_pct = max(0.007, (1.0 * atr_val) / current_price) 
 
         can_add_layer = False
         if len(layers) < 3 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
@@ -496,21 +496,17 @@ def process_bot_logic(symbol, mode, risk_pct):
                 active_position["avg_price"] = avg_price
                 active_position["total_qty"] = total_qty
                 active_position["total_cost"] = total_cost
-                active_position["tp_price"] = tp_price
                 active_position["sl_price"] = sl_price
 
-        status_trail = " (Trailing Active 🔥)" if active_position.get("trailing_tp_active", False) else ""
-        status_msg = f"SPOT DCA (LONG {len(layers)}/3 Layers){status_trail} | Avg: ${avg_price} | TP: ${tp_price} | Trailing/SL: ${sl_price}"
+        status_trail = " (Step Trailing Active 🔥)" if active_position.get("trailing_tp_active", False) else ""
+        status_msg = f"SPOT DCA (LONG {len(layers)}/3 Layers){status_trail} | Avg: ${avg_price} | Max Ride 🔥 | Trailing/SL: ${sl_price}"
         with state_lock:
             bot_state["status_message"] = status_msg
 
         trade_closed = False
         gross_pnl = 0.0
 
-        if current_price >= tp_price:
-            gross_pnl = (tp_price - avg_price) * total_qty
-            trade_closed = True
-        elif current_price <= sl_price:
+        if current_price <= sl_price:
             gross_pnl = (sl_price - avg_price) * total_qty
             trade_closed = True
 
@@ -520,7 +516,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             net_pnl = round(gross_pnl - est_binance_spot_fee, 2)
 
             if active_position.get("trailing_tp_active", False) or net_pnl >= 0:
-                outcome = f"ජයග්‍රහණය (Trailing Profit Hit 🔥 - {len(layers)} Layers)"
+                outcome = f"ජයග්‍රහණය (Step Trailing Hit 🔥 - {len(layers)} Layers)"
             else:
                 outcome = f"පරාජය (Emergency SL Hit)"
 
@@ -529,12 +525,12 @@ def process_bot_logic(symbol, mode, risk_pct):
                     "symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": round(total_qty, 4)
                 })
 
-            save_trade_to_db(active_position["entry_time"], symbol, "SPOT LONG", avg_price, len(layers), tp_price, sl_price, active_position["rsi"], active_position["macd"], active_position["ml_conf"], net_pnl, outcome)
+            save_trade_to_db(active_position["entry_time"], symbol, "SPOT LONG", avg_price, len(layers), 999999.0, sl_price, active_position["rsi"], active_position["macd"], active_position["ml_conf"], net_pnl, outcome)
 
             active_position = None
             last_trade_time = current_time
 
-    # 2. FLEXIBLE SPOT BASE ENTRY SIGNAL SEARCH
+    # 2. FAST FLEXIBLE SPOT BASE ENTRY SIGNAL SEARCH
     else:
         cooldown_period = 10  
         if (current_time - last_trade_time) < cooldown_period:
@@ -543,7 +539,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 bot_state["status_message"] = f"විරාමය (Cooldown): තව තත්පර {rem_sec}..."
         else:
             with state_lock:
-                bot_state["status_message"] = f"Golden Base Entry Signal (ML Filter: {min_ml_filter}%) නිරීක්ෂණය වේ..."
+                bot_state["status_message"] = f"Step Trailing Base Entry Signal (ML Filter: {min_ml_filter}%) නිරීක්ෂණය වේ..."
             
             tech_signal = None
             macd_diff = ind["macd"] - ind["macd_signal"]
@@ -554,7 +550,7 @@ def process_bot_logic(symbol, mode, risk_pct):
 
             if tech_signal and tech_signal == ml_signal and ml_conf >= min_ml_filter:
                 with state_lock:
-                    bot_state["status_message"] = f"Groq AI හරහා Golden Base Entry එක තහවුරු කරමින්..."
+                    bot_state["status_message"] = f"Groq AI හරහා Step Trailing Base Entry එක තහවුරු කරමින්..."
                 
                 ai_approved, ai_reason = analyze_trade_with_groq_ai(
                     tech_signal, current_price, ind["rsi"], 
@@ -683,9 +679,9 @@ def start_bot():
             bot_state["current_balance"] = init_bal
             
         bot_state["is_running"] = True
-        bot_state["status_message"] = f"Binance Spot Golden DCA AI Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
+        bot_state["status_message"] = f"Binance Spot Step Trailing AI Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
         
-    return jsonify({"status": "success", "message": "Golden DCA Spot Bot සාර්ථකව ආරම්භ විය!"})
+    return jsonify({"status": "success", "message": "Step Trailing Spot Bot සාර්ථකව ආරම්භ විය!"})
 
 @app.route("/api/reset_demo", methods=["POST"])
 def reset_demo():
@@ -750,7 +746,7 @@ def get_status():
                 "avg_price": active_position["avg_price"],
                 "total_qty": active_position["total_qty"],
                 "total_cost": active_position["total_cost"],
-                "tp_price": active_position["tp_price"],
+                "tp_price": "Unlimited Ride 🔥",
                 "sl_price": active_position["sl_price"],
                 "unrealized_pnl": unrealized_pnl,
                 "entry_time": active_position["entry_time"],
