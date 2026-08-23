@@ -390,8 +390,7 @@ def recalculate_spot_dca_levels(layers):
     # Pro High Profit Take Profit Target: 1.8% above avg entry ($3.60 - $10.80+ Net Gains)
     tp_price = round(avg_price * 1.018, 4)
     lowest_price = min(l["price"] for l in layers)
-    # PRECISION FIX: Reduced Emergency SL to 0.3% below lowest layer (-$2.70 - $3.50 max loss on 3 layers)
-    sl_price = round(lowest_price * 0.997, 4) 
+    sl_price = round(lowest_price * 0.992, 4) # Tight SL (0.8% below lowest layer = -$4.50 max loss)
 
     return round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), tp_price, sl_price
 
@@ -466,7 +465,7 @@ def process_bot_logic(symbol, mode, risk_pct):
         # SAFETY LAYER CONDITIONAL FILTER: Only buy Layer 2 & 3 if RSI is Oversold (< 38)
         can_add_layer = False
         if len(layers) < 3 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
-            if ind["rsi"] <= 38: 
+            if ind["rsi"] <= 38: # Prevents buying layers during a continuous crash
                 can_add_layer = True
 
         if can_add_layer:
