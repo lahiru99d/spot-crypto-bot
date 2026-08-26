@@ -175,12 +175,13 @@ def get_db_stats_and_dynamic_filter():
     except Exception as e:
         return 0, 0.0, 50.0
 
+# LIVE REAL-TIME BINANCE SPOT ENDPOINTS
 PUBLIC_BINANCE_URLS = [
-    "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
-    "https://api3.binance.com"
+    "https://api3.binance.com",
+    "https://data-api.binance.vision"
 ]
 
 def spot_public_request(endpoint, params=None):
@@ -390,11 +391,9 @@ def recalculate_spot_dca_levels(layers, is_trend_rider=False):
     lowest_price = min(l["price"] for l in layers)
 
     if is_trend_rider:
-        # Trend Rider Mode: Unlimited Upper Ceiling + Tight 0.8% SL (-$4.50 max loss)
         tp_price = 999999.0 
         sl_price = round(avg_price * 0.992, 4)
     else:
-        # Smart DCA Mode: High Profit TP (+1.8%) + Micro SL (-0.3% below lowest layer = -$2.50 max loss)
         tp_price = round(avg_price * 1.018, 4)
         sl_price = round(lowest_price * 0.997, 4) 
 
@@ -470,7 +469,6 @@ def process_bot_logic(symbol, mode, risk_pct):
                 active_position["trailing_tp_active"] = True
                 sl_price = new_sl
 
-        # Safety Layer DCA is allowed ONLY in SMART_DCA Mode (Disabled in TREND_RIDER)
         can_add_layer = False
         if regime == "SMART_DCA" and len(layers) < 3 and current_price <= last_layer_price * 0.992 and not active_position.get("trailing_tp_active", False):
             can_add_layer = True
@@ -560,15 +558,13 @@ def process_bot_logic(symbol, mode, risk_pct):
             macd_diff = ind["macd"] - ind["macd_signal"]
             ema_gap_pct = (abs(ind["ema_20"] - ind["ema_200"]) / current_price) * 100
 
-            # ----------------- REGIME DECISION ENGINE -----------------
-            # 1. STRONG TREND REGIME -> Execute Single Entry Trend Rider
+            # REGIME DECISION ENGINE
             is_strong_trend = (current_price > ind["ema_200"] and 
                                ind["ema_20"] > ind["ema_50"] and 
                                macd_diff > 0 and 
                                ema_gap_pct >= 0.12 and 
                                45 <= ind["rsi"] <= 72)
 
-            # 2. RANGE / DIP REGIME -> Execute Smart Spot DCA
             is_dca_setup = ((ind["ema_20"] > ind["ema_50"] or macd_diff > 0) and 
                             (30 <= ind["rsi"] <= 65))
 
