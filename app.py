@@ -175,7 +175,6 @@ def get_db_stats_and_dynamic_filter():
     except Exception as e:
         return 0, 0.0, 50.0
 
-# LIVE REAL-TIME BINANCE SPOT ENDPOINTS
 PUBLIC_BINANCE_URLS = [
     "https://api.binance.com",
     "https://api1.binance.com",
@@ -391,11 +390,14 @@ def recalculate_spot_dca_levels(layers, is_trend_rider=False):
     lowest_price = min(l["price"] for l in layers)
 
     if is_trend_rider:
+        # Trend Rider Mode: Unlimited Upper Target + 1.0% SL
         tp_price = 999999.0 
-        sl_price = round(avg_price * 0.992, 4)
+        sl_price = round(avg_price * 0.990, 4)
     else:
-        tp_price = round(avg_price * 1.018, 4)
-        sl_price = round(lowest_price * 0.997, 4) 
+        # Smart DCA Mode: TP = +1.5% | Emergency SL = 1.5% below lowest layer
+        # This guarantees Layer 2 & Layer 3 ALWAYS have room to buy dips before SL hits!
+        tp_price = round(avg_price * 1.015, 4)
+        sl_price = round(lowest_price * 0.985, 4) 
 
     return round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), tp_price, sl_price
 
