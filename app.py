@@ -37,7 +37,7 @@ bot_state = {
     "current_balance": 1000.0,
     
     "current_price": 0.0,
-    "status_message": "Autonomous Dual-Regime AI Engine සජීවීව ක්‍රියාත්මක වේ...",
+    "status_message": "Pro High Profit Spot DCA Engine සජීවීව ක්‍රියාත්මක වේ...",
     "wins": 0,
     "losses": 0,
     "total_trades": 0,
@@ -60,7 +60,7 @@ bot_state = {
     "ml_signal": "NEUTRAL",
     "ml_confidence": 0.0,
     "ai_decision": "WAITING",
-    "ai_reasoning": "Autonomous Dual-Regime AI Engine සූදානම්ව පවතී...",
+    "ai_reasoning": "Pro High Profit Engine සූදානම්ව පවතී...",
     "db_total_trades": 0,
     "db_win_rate": 0.0,
     "auto_tuned_ml_filter": 50.0
@@ -176,11 +176,11 @@ def get_db_stats_and_dynamic_filter():
         return 0, 0.0, 50.0
 
 PUBLIC_BINANCE_URLS = [
+    "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://data-api.binance.vision"
+    "https://api3.binance.com"
 ]
 
 def spot_public_request(endpoint, params=None):
@@ -236,7 +236,7 @@ def analyze_trade_with_groq_ai(signal, price, rsi, macd, ema20, ema200, ml_conf,
     current_time = time.time()
     
     if (current_time - last_groq_call_time) < GROQ_COOLDOWN_SECONDS:
-        return True, "Groq Limit Protection: Autonomous AI Entry approved."
+        return True, "Groq Limit Protection: Pro High Profit Base Layer approved."
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -266,7 +266,7 @@ def analyze_trade_with_groq_ai(signal, price, rsi, macd, ema20, ema200, ml_conf,
             if json_match:
                 parsed = json.loads(json_match.group(0))
                 decision = parsed.get("decision", "REJECT") == "CONFIRM"
-                reason = parsed.get("reason", "AI Approved Autonomous Entry")
+                reason = parsed.get("reason", "AI Approved Pro High Profit Base Entry")
                 return decision, reason
         return True, "Groq AI bypass due to API limit/timeout."
     except Exception as e:
@@ -382,22 +382,15 @@ def get_klines_and_indicators(symbol):
     
     return chart_candles, indicators, df
 
-def recalculate_spot_dca_levels(layers, is_trend_rider=False):
+def recalculate_spot_dca_levels(layers):
     total_qty = sum(l["qty"] for l in layers)
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
+    # Pro High Profit Take Profit Target: 1.8% above avg entry ($3.60 - $10.80+ Net Gains)
+    tp_price = round(avg_price * 1.018, 4)
     lowest_price = min(l["price"] for l in layers)
-
-    if is_trend_rider:
-        # Trend Rider Mode: Unlimited Upper Target + 1.0% SL
-        tp_price = 999999.0 
-        sl_price = round(avg_price * 0.990, 4)
-    else:
-        # Smart DCA Mode: TP = +1.5% | Emergency SL = 1.5% below lowest layer
-        # This guarantees Layer 2 & Layer 3 ALWAYS have room to buy dips before SL hits!
-        tp_price = round(avg_price * 1.015, 4)
-        sl_price = round(lowest_price * 0.985, 4) 
+    sl_price = round(lowest_price * 0.992, 4) # Tight SL (0.8% below lowest layer = -$4.50 max loss)
 
     return round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), tp_price, sl_price
 
@@ -446,7 +439,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 with state_lock:
                     bot_state["current_balance"] = float(usdt_asset["free"])
 
-    # 1. AUTONOMOUS DUAL-REGIME POSITION EXECUTION
+    # 1. PRO HIGH PROFIT SPOT DCA + WIDE TRAILING GUARD
     if active_position:
         layers = active_position["layers"]
         avg_price = active_position["avg_price"]
@@ -454,16 +447,11 @@ def process_bot_logic(symbol, mode, risk_pct):
         tp_price = active_position["tp_price"]
         sl_price = active_position["sl_price"]
         last_layer_price = layers[-1]["price"]
-        regime = active_position.get("regime", "SMART_DCA")
 
-        # Dynamic Trailing Profit Guard Activation
-        trail_trigger_pct = 1.0050 if regime == "TREND_RIDER" else 1.0035
-        trail_floor_pct = 1.0030 if regime == "TREND_RIDER" else 1.0028
-
-        if current_price >= avg_price * trail_trigger_pct:
-            min_profit_sl = round(avg_price * trail_floor_pct, 4) 
-            atr_mult = 1.2 if regime == "TREND_RIDER" else 0.6
-            potential_trailing_sl = round(current_price - (atr_mult * atr_val), 4)
+        # Wide Trailing Profit Guard (+0.80% activation, 1.5*ATR breathing space for BIG RIDES)
+        if current_price >= avg_price * 1.0080:
+            min_profit_sl = round(avg_price * 1.0050, 4) 
+            potential_trailing_sl = round(current_price - (1.5 * atr_val), 4)
             new_sl = max(min_profit_sl, potential_trailing_sl)
 
             if new_sl > sl_price:
@@ -471,9 +459,14 @@ def process_bot_logic(symbol, mode, risk_pct):
                 active_position["trailing_tp_active"] = True
                 sl_price = new_sl
 
+        # Safety Layer step distance
+        layer_step_pct = max(0.008, (1.2 * atr_val) / current_price) 
+
+        # SAFETY LAYER CONDITIONAL FILTER: Only buy Layer 2 & 3 if RSI is Oversold (< 38)
         can_add_layer = False
-        if regime == "SMART_DCA" and len(layers) < 3 and current_price <= last_layer_price * 0.992 and not active_position.get("trailing_tp_active", False):
-            can_add_layer = True
+        if len(layers) < 3 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
+            if ind["rsi"] <= 38: # Prevents buying layers during a continuous crash
+                can_add_layer = True
 
         if can_add_layer:
             with state_lock:
@@ -500,7 +493,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                     "cost": round(next_layer_usd, 2),
                     "time": entry_time_str
                 })
-                avg_price, total_qty, total_cost, tp_price, sl_price = recalculate_spot_dca_levels(layers, is_trend_rider=False)
+                avg_price, total_qty, total_cost, tp_price, sl_price = recalculate_spot_dca_levels(layers)
                 
                 active_position["layers"] = layers
                 active_position["avg_price"] = avg_price
@@ -509,9 +502,8 @@ def process_bot_logic(symbol, mode, risk_pct):
                 active_position["tp_price"] = tp_price
                 active_position["sl_price"] = sl_price
 
-        status_trail = " (Trailing Active 🔥)" if active_position.get("trailing_tp_active", False) else ""
-        tp_display = "Unlimited Pump Ride 🔥" if tp_price >= 900000 else f"${tp_price}"
-        status_msg = f"SPOT {regime} (LONG {len(layers)} Layers){status_trail} | Avg: ${avg_price} | TP: {tp_display} | Trailing/SL: ${sl_price}"
+        status_trail = " (Pro Trailing Active 🔥)" if active_position.get("trailing_tp_active", False) else ""
+        status_msg = f"SPOT DCA (LONG {len(layers)}/3 Layers){status_trail} | Avg: ${avg_price} | TP: ${tp_price} | Trailing/SL: ${sl_price}"
         with state_lock:
             bot_state["status_message"] = status_msg
 
@@ -531,7 +523,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             net_pnl = round(gross_pnl - est_binance_spot_fee, 2)
 
             if active_position.get("trailing_tp_active", False) or net_pnl >= 0:
-                outcome = f"ජයග්‍රහණය ({regime} Hit 🔥 - {len(layers)} Layers)"
+                outcome = f"ජයග්‍රහණය (Pro Trailing Hit 🔥 - {len(layers)} Layers)"
             else:
                 outcome = f"පරාජය (Emergency SL Hit)"
 
@@ -540,12 +532,12 @@ def process_bot_logic(symbol, mode, risk_pct):
                     "symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": round(total_qty, 4)
                 })
 
-            save_trade_to_db(active_position["entry_time"], symbol, f"SPOT {regime}", avg_price, len(layers), tp_price, sl_price, active_position["rsi"], active_position["macd"], active_position["ml_conf"], net_pnl, outcome)
+            save_trade_to_db(active_position["entry_time"], symbol, "SPOT LONG", avg_price, len(layers), tp_price, sl_price, active_position["rsi"], active_position["macd"], active_position["ml_conf"], net_pnl, outcome)
 
             active_position = None
             last_trade_time = current_time
 
-    # 2. AUTONOMOUS REGIME SEARCH & ENTRY TRIGGER
+    # 2. FLEXIBLE SPOT BASE ENTRY SIGNAL SEARCH
     else:
         cooldown_period = 10  
         if (current_time - last_trade_time) < cooldown_period:
@@ -554,30 +546,21 @@ def process_bot_logic(symbol, mode, risk_pct):
                 bot_state["status_message"] = f"විරාමය (Cooldown): තව තත්පර {rem_sec}..."
         else:
             with state_lock:
-                bot_state["status_message"] = f"Autonomous AI Signal (ML Filter: {min_ml_filter}%) නිරීක්ෂණය වේ..."
+                bot_state["status_message"] = f"Pro Base Entry Signal (ML Filter: {min_ml_filter}%) නිරීක්ෂණය වේ..."
             
             tech_signal = None
             macd_diff = ind["macd"] - ind["macd_signal"]
-            ema_gap_pct = (abs(ind["ema_20"] - ind["ema_200"]) / current_price) * 100
 
-            # REGIME DECISION ENGINE
-            is_strong_trend = (current_price > ind["ema_200"] and 
-                               ind["ema_20"] > ind["ema_50"] and 
-                               macd_diff > 0 and 
-                               ema_gap_pct >= 0.12 and 
-                               45 <= ind["rsi"] <= 72)
+            if ((ind["ema_20"] > ind["ema_50"] or macd_diff > 0) and 
+                (30 <= ind["rsi"] <= 72)):
+                tech_signal = "LONG"
 
-            is_dca_setup = ((ind["ema_20"] > ind["ema_50"] or macd_diff > 0) and 
-                            (30 <= ind["rsi"] <= 65))
-
-            detected_regime = "TREND_RIDER" if is_strong_trend else ("SMART_DCA" if is_dca_setup else None)
-
-            if detected_regime and ml_signal == "LONG" and ml_conf >= min_ml_filter:
+            if tech_signal and tech_signal == ml_signal and ml_conf >= min_ml_filter:
                 with state_lock:
-                    bot_state["status_message"] = f"Groq AI හරහා {detected_regime} Entry එක තහවුරු කරමින්..."
+                    bot_state["status_message"] = f"Groq AI හරහා Pro Base Entry එක තහවුරු කරමින්..."
                 
                 ai_approved, ai_reason = analyze_trade_with_groq_ai(
-                    detected_regime, current_price, ind["rsi"], 
+                    tech_signal, current_price, ind["rsi"], 
                     ind["macd"], ind["ema_20"], ind["ema_200"], ml_conf, db_win_rate
                 )
 
@@ -610,13 +593,10 @@ def process_bot_logic(symbol, mode, risk_pct):
                                 "cost": round(base_layer_usd, 2),
                                 "time": entry_time_str
                             }]
-                            
-                            is_tr = (detected_regime == "TREND_RIDER")
-                            avg_price, total_qty, total_cost, tp_price, sl_price = recalculate_spot_dca_levels(initial_layers, is_trend_rider=is_tr)
+                            avg_price, total_qty, total_cost, tp_price, sl_price = recalculate_spot_dca_levels(initial_layers)
 
                             active_position = {
                                 "side": "SPOT LONG",
-                                "regime": detected_regime,
                                 "layers": initial_layers,
                                 "avg_price": avg_price,
                                 "total_qty": total_qty,
@@ -629,7 +609,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                             }
 
                             with state_lock:
-                                bot_state["status_message"] = f"Binance Spot Autonomous Base Layer 1 ({detected_regime}) ඇතුළත් විය!"
+                                bot_state["status_message"] = f"Binance Spot Base Layer 1 (ETH) ඇතුළත් විය!"
 
 def bot_worker():
     while True:
@@ -706,9 +686,9 @@ def start_bot():
             bot_state["current_balance"] = init_bal
             
         bot_state["is_running"] = True
-        bot_state["status_message"] = f"Binance Spot Autonomous AI Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
+        bot_state["status_message"] = f"Binance Spot Pro High Profit Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
         
-    return jsonify({"status": "success", "message": "Autonomous AI Spot Bot සාර්ථකව ආරම්භ විය!"})
+    return jsonify({"status": "success", "message": "Pro High Profit Spot Bot සාර්ථකව ආරම්භ විය!"})
 
 @app.route("/api/reset_demo", methods=["POST"])
 def reset_demo():
@@ -768,13 +748,12 @@ def get_status():
             unrealized_pnl = round((bot_state["current_price"] - active_position["avg_price"]) * active_position["total_qty"], 2)
             active_pos_data = {
                 "side": active_position["side"],
-                "regime": active_position.get("regime", "SMART_DCA"),
                 "layers": active_position["layers"],
                 "layers_count": len(active_position["layers"]),
                 "avg_price": active_position["avg_price"],
                 "total_qty": active_position["total_qty"],
                 "total_cost": active_position["total_cost"],
-                "tp_price": "Unlimited Pump Ride 🔥" if active_position["tp_price"] >= 900000 else active_position["tp_price"],
+                "tp_price": active_position["tp_price"],
                 "sl_price": active_position["sl_price"],
                 "unrealized_pnl": unrealized_pnl,
                 "entry_time": active_position["entry_time"],
