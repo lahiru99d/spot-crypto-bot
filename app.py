@@ -23,12 +23,12 @@ bot_state = {
     "mode": "paper",       
     "symbol": "ETHUSDT",   
     "leverage": 1,         
-    "risk_pct": 10.0,  # Safe Base Risk (10%)
+    "risk_pct": 10.0,  # Single-trade Base Risk (10%)
     "virtual_balance": 1000.0,
     "current_balance": 1000.0,
     
     "current_price": 0.0,
-    "status_message": "High-Speed Quant DCA Engine සජීවීව ක්‍රියාත්මක වේ...",
+    "status_message": "Fast Scalp Quant Engine සජීවීව ක්‍රියාත්මක වේ...",
     "wins": 0,
     "losses": 0,
     "total_trades": 0,
@@ -51,10 +51,10 @@ bot_state = {
     "ml_signal": "NEUTRAL",
     "ml_confidence": 0.0,
     "ai_decision": "WAITING",
-    "ai_reasoning": "Quant Engine සූදානම්ව පවතී...",
+    "ai_reasoning": "Fast Scalp Engine සූදානම්ව පවතී...",
     "db_total_trades": 0,
     "db_win_rate": 0.0,
-    "auto_tuned_ml_filter": 52.0
+    "auto_tuned_ml_filter": 50.0
 }
 
 active_position = None  
@@ -85,7 +85,7 @@ def init_db():
         ''')
         conn.commit()
         conn.close()
-        print("[DATABASE] SQLite Engine initialized successfully!")
+        print("[DATABASE] SQLite Memory Engine initialized successfully!")
     except Exception as e:
         print(f"[DATABASE ERROR] Could not initialize DB: {e}")
 
@@ -129,7 +129,7 @@ def load_db_history():
             bot_state["db_total_trades"] = tot_trades
             bot_state["db_win_rate"] = acc
 
-        print(f"[DATABASE] Loaded {len(history_trades)} trades into memory.")
+        print(f"[DATABASE] Auto-Loaded {len(history_trades)} trades into memory.")
     except Exception as e:
         print(f"[DATABASE ERROR] Could not load DB history: {e}")
 
@@ -160,10 +160,10 @@ def get_db_stats_and_dynamic_filter():
 
         total_trades = total_count if total_count else 0
         historical_win_rate = round((total_wins / total_trades * 100), 1) if total_trades > 0 else 0.0
-        min_ml_threshold = 52.0  
+        min_ml_threshold = 50.0  # Fast trigger threshold
         return total_trades, historical_win_rate, min_ml_threshold
     except Exception:
-        return 0, 0.0, 52.0
+        return 0, 0.0, 50.0
 
 PUBLIC_BINANCE_URLS = [
     "https://data-api.binance.vision",
@@ -220,30 +220,27 @@ def spot_signed_request(endpoint, method="GET", params=None):
             
     return {"error": "Connection error or blocked endpoint"}
 
-# ----------------- LOCAL QUANTITATIVE VALIDATOR (REPLACES GROQ) -----------------
+# ----------------- LOCAL SCALP VALIDATOR (0.001ms Instant Execution) -----------------
 def validate_quantitative_entry(price, rsi, macd, macd_signal, ema20, ema50, ema200, ml_conf):
     """
-    Ultra-Fast (0.001ms) Rule Validator:
-    Replaces slow external LLMs with mathematical risk rules.
+    High-Frequency Scalp Filter:
+    - Triggers on Micro Momentum (EMA 20 > EMA 50 OR MACD > 0)
+    - Safe RSI range (32 to 70)
+    - Fast ML confirmation (>= 50%)
     """
-    # 1. Macro Trend Check: Price MUST be above EMA 200 (No buying in a dump)
-    if price < ema200:
-        return False, "Bearish Trend: Price is below EMA 200."
-    
-    # 2. RSI Boundary Check: Avoid Overbought or Extreme Freefall
-    if not (36.0 <= rsi <= 68.0):
-        return False, f"RSI Out of Range: RSI is {rsi} (Safe: 36-68)."
-    
-    # 3. Micro Momentum Check: EMA 20 > EMA 50 or MACD bullish crossover
     macd_diff = macd - macd_signal
-    if not (ema20 > ema50 or macd_diff > 0):
-        return False, "Momentum Weak: No EMA/MACD Bullish Cross."
-    
-    # 4. Machine Learning Confidence Check
-    if ml_conf < 52.0:
-        return False, f"ML Filter: Confidence is below target ({ml_conf}%)."
+    momentum_ok = (ema20 > ema50) or (macd_diff > 0)
 
-    return True, "Quant Approved: 200 EMA Uptrend + Momentum + ML Confluence"
+    if not momentum_ok:
+        return False, "Momentum Weak: Waiting for EMA/MACD crossover."
+
+    if not (32.0 <= rsi <= 70.0):
+        return False, f"RSI Out of Range: {rsi} (Safe: 32-70)."
+
+    if ml_conf < 50.0:
+        return False, f"ML Filter: Confidence is below 50% ({ml_conf}%)."
+
+    return True, "Quant Scalp Approved: Momentum + RSI + ML Aligned"
 
 def train_and_predict_ml(df):
     try:
@@ -261,14 +258,14 @@ def train_and_predict_ml(df):
         X = clean_df[features][:-1]
         y = clean_df['target'][:-1]
         
-        model = RandomForestClassifier(n_estimators=45, max_depth=4, random_state=42)
+        model = RandomForestClassifier(n_estimators=40, max_depth=4, random_state=42)
         model.fit(X, y)
         
         latest_features = clean_df[features].iloc[-1:].values
         probs = model.predict_proba(latest_features)[0]
         prob_up = probs[1] * 100
         
-        if prob_up >= 52.0:
+        if prob_up >= 50.0:
             return "LONG", round(prob_up, 1)
         else:
             return "NEUTRAL", round(prob_up, 1)
@@ -287,7 +284,7 @@ def get_klines_and_indicators(symbol):
         'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
     ])
     
-    # Strictly format Unix Seconds and sort to guarantee clean Chart rendering
+    # Clean and strictly sort timestamps for bug-free Chart rendering
     df['time'] = (df['time'].astype(int) / 1000).astype(int)
     df = df.drop_duplicates(subset=['time']).sort_values('time').reset_index(drop=True)
 
@@ -323,7 +320,7 @@ def get_klines_and_indicators(symbol):
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df['atr'] = tr.rolling(window=14).mean()
 
-    # Build clean JSON structures without NaNs for frontend charts
+    # Build clean JSON lists without NaNs
     chart_candles = []
     ema_20_list = []
     ema_50_list = []
@@ -363,22 +360,22 @@ def get_klines_and_indicators(symbol):
 
 def recalculate_spot_dca_levels(layers):
     """
-    MAX 2-LAYER SAFE DCA:
-    - 1 Layer: Aim for 1.8% gain
-    - 2 Layers: Fast Break-Even Exit (+0.6%) to escape without big loss
-    - Tight Stop Loss: 0.75% below lowest layer
+    SCALPING DCA LOGIC:
+    - Layer 1: Fast Take Profit target = +0.75% (Quick $1.20 - $1.60 gain in 10-25 mins)
+    - Layer 2: Fast Break-Even exit = +0.45%
+    - Tight Stop Loss = 0.70% below lowest layer
     """
     total_qty = sum(l["qty"] for l in layers)
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
     if len(layers) == 1:
-        tp_price = round(avg_price * 1.018, 4)
+        tp_price = round(avg_price * 1.0075, 4) 
     else:
-        tp_price = round(avg_price * 1.006, 4)  # Break-Even Escape
+        tp_price = round(avg_price * 1.0045, 4)
 
     lowest_price = min(l["price"] for l in layers)
-    sl_price = round(lowest_price * 0.9925, 4)  # Max loss cut strictly
+    sl_price = round(lowest_price * 0.9930, 4)
 
     return round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), tp_price, sl_price
 
@@ -427,7 +424,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 with state_lock:
                     bot_state["current_balance"] = float(usdt_asset["free"])
 
-    # 1. POSITION MANAGEMENT (STRICT MAX 2 LAYERS)
+    # 1. POSITION MANAGEMENT (MAX 2 LAYERS)
     if active_position:
         layers = active_position["layers"]
         avg_price = active_position["avg_price"]
@@ -436,10 +433,10 @@ def process_bot_logic(symbol, mode, risk_pct):
         sl_price = active_position["sl_price"]
         last_layer_price = layers[-1]["price"]
 
-        # Trailing Profit Guard (+0.8% Activation)
-        if current_price >= avg_price * 1.0080:
-            min_profit_sl = round(avg_price * 1.0040, 4) 
-            potential_trailing_sl = round(current_price - (1.2 * atr_val), 4)
+        # Fast Scalp Trailing Lock: Activates at +0.45%, locks at +0.25%
+        if current_price >= avg_price * 1.0045:
+            min_profit_sl = round(avg_price * 1.0025, 4) 
+            potential_trailing_sl = round(current_price - (0.8 * atr_val), 4)
             new_sl = max(min_profit_sl, potential_trailing_sl)
 
             if new_sl > sl_price:
@@ -448,7 +445,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 sl_price = new_sl
 
         # Step distance for Safety Layer
-        layer_step_pct = max(0.010, (1.5 * atr_val) / current_price) 
+        layer_step_pct = max(0.009, (1.2 * atr_val) / current_price) 
 
         # SAFETY LAYER 2 ONLY (Never Layer 3)
         can_add_layer = False
@@ -460,7 +457,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             with state_lock:
                 balance = bot_state["current_balance"]
             
-            # Layer 2 uses 60% of base layer risk to prevent overexposure
+            # Layer 2 uses 60% of base risk to protect balance
             next_layer_usd = max(6.0, balance * ((risk_pct * 0.6) / 100)) 
             next_layer_qty = round(next_layer_usd / current_price, 4)
 
@@ -492,7 +489,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 active_position["sl_price"] = sl_price
 
         status_trail = " (Trailing Active 🔥)" if active_position.get("trailing_tp_active", False) else ""
-        status_msg = f"SPOT DCA (LONG {len(layers)}/2 Layers){status_trail} | Avg: ${avg_price} | TP: ${tp_price} | SL: ${sl_price}"
+        status_msg = f"SPOT SCALP (LONG {len(layers)}/2 Layers){status_trail} | Avg: ${avg_price} | TP: ${tp_price} | SL: ${sl_price}"
         with state_lock:
             bot_state["status_message"] = status_msg
 
@@ -508,13 +505,13 @@ def process_bot_logic(symbol, mode, risk_pct):
 
         if trade_closed:
             notional_val = total_qty * avg_price
-            est_binance_spot_fee = (notional_val * 2) * 0.00075 
+            est_binance_spot_fee = (notional_val * 2) * 0.00075  # Binance BNB discount fee
             net_pnl = round(gross_pnl - est_binance_spot_fee, 2)
 
             if net_pnl >= 0:
                 outcome = f"ජයග්‍රහණය (Take Profit / Trailing - {len(layers)} Layers)"
             else:
-                outcome = f"පරාජය (Controlled Small SL - {len(layers)} Layers)"
+                outcome = f"පරාජය (Controlled SL - {len(layers)} Layers)"
 
             if mode == "real":
                 spot_signed_request("/api/v3/order", "POST", {
@@ -526,18 +523,18 @@ def process_bot_logic(symbol, mode, risk_pct):
             active_position = None
             last_trade_time = current_time
 
-    # 2. BASE ENTRY CONDITIONS (QUANT VALIDATED)
+    # 2. SCALP BASE ENTRY SEARCH (FREQUENT INTRADAY SIGNALS)
     else:
-        cooldown_period = 10  
+        cooldown_period = 10  # Short 10s cooldown to allow frequent trades
         if (current_time - last_trade_time) < cooldown_period:
             rem_sec = int(cooldown_period - (current_time - last_trade_time))
             with state_lock:
                 bot_state["status_message"] = f"විරාමය (Cooldown): තව තත්පර {rem_sec}..."
         else:
             with state_lock:
-                bot_state["status_message"] = f"Quant Strategy (ML Filter: {min_ml_filter}%) නිරීක්ෂණය වේ..."
+                bot_state["status_message"] = f"Scalp Strategy (ML Filter: {min_ml_filter}%) නිරීක්ෂණය වේ..."
 
-            # Validate entry instantly via Quantitative Mathematical Engine
+            # Validate entry via instant local Quant Scalp logic
             is_valid_entry, reason = validate_quantitative_entry(
                 current_price, ind["rsi"], ind["macd"], ind["macd_signal"],
                 ind["ema_20"], ind["ema_50"], ind["ema_200"], ml_conf
@@ -588,7 +585,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                         }
 
                         with state_lock:
-                            bot_state["status_message"] = "Quant Confirmed: Base Layer 1 ඇතුළත් විය!"
+                            bot_state["status_message"] = "Scalp Confirmed: Base Layer 1 ඇතුළත් විය!"
 
 def bot_worker():
     while True:
@@ -665,9 +662,9 @@ def start_bot():
             bot_state["current_balance"] = init_bal
             
         bot_state["is_running"] = True
-        bot_state["status_message"] = f"Binance Spot Quant Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
+        bot_state["status_message"] = f"Binance Spot Fast Scalp Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
         
-    return jsonify({"status": "success", "message": "Quant Engine සාර්ථකව ආරම්භ විය!"})
+    return jsonify({"status": "success", "message": "Fast Scalp Engine සාර්ථකව ආරම්භ විය!"})
 
 @app.route("/api/reset_demo", methods=["POST"])
 def reset_demo():
