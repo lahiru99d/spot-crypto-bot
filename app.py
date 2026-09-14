@@ -15,6 +15,14 @@ from sklearn.ensemble import RandomForestClassifier
 
 app = Flask(__name__)
 
+# ----------------- GROQ AI API CONFIGURATION -----------------
+GROQ_API_KEY = "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"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+last_groq_call_time = 0
+GROQ_COOLDOWN_SECONDS = 45  
+
 DB_FILE = "bot_memory.db"
 
 bot_state = {
@@ -24,7 +32,7 @@ bot_state = {
     "mode": "paper",       
     "symbol": "ETHUSDT",   
     "leverage": 1,         
-    "risk_pct": 20.0,       
+    "risk_pct": 15.0,       
     "virtual_balance": 1000.0,
     "current_balance": 1000.0,
     
@@ -51,7 +59,7 @@ bot_state = {
 
     "ml_signal": "NEUTRAL",
     "ml_confidence": 0.0,
-    "ai_decision": "CONFIRMED",
+    "ai_decision": "WAITING",
     "ai_reasoning": "Pro High Profit Engine සූදානම්ව පවතී...",
     "db_total_trades": 0,
     "db_win_rate": 0.0,
@@ -223,6 +231,47 @@ def spot_signed_request(endpoint, method="GET", params=None):
             
     return {"error": "Connection error or blocked endpoint"}
 
+def analyze_trade_with_groq_ai(signal, price, rsi, macd, ema20, ema200, ml_conf, hist_win_rate):
+    global last_groq_call_time
+    current_time = time.time()
+    
+    if (current_time - last_groq_call_time) < GROQ_COOLDOWN_SECONDS:
+        return True, "Groq Limit Protection: Pro High Profit Base Layer approved."
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    prompt = f"""
+    You are an expert Crypto Spot DCA Risk Manager. Validate base entry:
+    Symbol: {signal}, Price: {price}, RSI: {rsi}, MACD: {macd}, ML Conf: {ml_conf}%
+    Respond ONLY in JSON: {{"decision": "CONFIRM" or "REJECT", "reason": "Short summary"}}
+    """
+
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 120
+    }
+
+    try:
+        last_groq_call_time = time.time()
+        res = requests.post(GROQ_URL, json=payload, headers=headers, timeout=4)
+        if res.status_code == 200:
+            result = res.json()
+            content = result['choices'][0]['message']['content']
+            json_match = re.search(r'\{.*\}', content, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group(0))
+                decision = parsed.get("decision", "REJECT") == "CONFIRM"
+                reason = parsed.get("reason", "AI Approved Pro High Profit Base Entry")
+                return decision, reason
+        return True, "Groq AI bypass due to API limit/timeout."
+    except Exception as e:
+        return True, "Groq AI bypass due to connection timeout."
+
 def train_and_predict_ml(df):
     try:
         df['ema_diff_20_200'] = (df['ema_20'] - df['ema_200']) / df['close']
@@ -390,7 +439,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 with state_lock:
                     bot_state["current_balance"] = float(usdt_asset["free"])
 
-    # 1. PRO HIGH PROFIT SPOT DCA + WIDE TRAILING GUARD (උපරිම Layers 2 පමණි)
+    # 1. PRO HIGH PROFIT SPOT DCA + WIDE TRAILING GUARD
     if active_position:
         layers = active_position["layers"]
         avg_price = active_position["avg_price"]
@@ -413,7 +462,7 @@ def process_bot_logic(symbol, mode, risk_pct):
         # Safety Layer step distance
         layer_step_pct = max(0.008, (1.2 * atr_val) / current_price) 
 
-        # SAFETY LAYER 2 CONDITIONAL FILTER: Only buy Layer 2 (Max 2 Layers) if RSI is Oversold (< 38)
+        # SAFETY LAYER CONDITIONAL FILTER: Only buy Layer 2 if RSI is Oversold (< 38)
         can_add_layer = False
         if len(layers) < 2 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
             if ind["rsi"] <= 38: # Prevents buying layers during a continuous crash
@@ -423,9 +472,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             with state_lock:
                 balance = bot_state["current_balance"]
             
-            # Layer 2 මුදල Layer 1 න් අඩකි (50% - උදා: Layer 1 = 20%, Layer 2 = 10%)
-            layer_2_risk_pct = risk_pct * 0.5
-            next_layer_usd = max(6.0, balance * (layer_2_risk_pct / 100)) 
+            next_layer_usd = max(6.0, balance * (risk_pct / 100)) 
             next_layer_qty = round(next_layer_usd / current_price, 4)
 
             order_ok = True
@@ -490,7 +537,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             active_position = None
             last_trade_time = current_time
 
-    # 2. FLEXIBLE SPOT BASE ENTRY SIGNAL SEARCH (GROQ ඉවත් කර සෘජුව ක්‍රියාත්මක වේ)
+    # 2. FLEXIBLE SPOT BASE ENTRY SIGNAL SEARCH
     else:
         cooldown_period = 10  
         if (current_time - last_trade_time) < cooldown_period:
@@ -510,51 +557,59 @@ def process_bot_logic(symbol, mode, risk_pct):
 
             if tech_signal and tech_signal == ml_signal and ml_conf >= min_ml_filter:
                 with state_lock:
-                    bot_state["ai_decision"] = "CONFIRMED"
-                    bot_state["ai_reasoning"] = "Technical & ML Base Entry Approved"
+                    bot_state["status_message"] = f"Groq AI හරහා Pro Base Entry එක තහවුරු කරමින්..."
+                
+                ai_approved, ai_reason = analyze_trade_with_groq_ai(
+                    tech_signal, current_price, ind["rsi"], 
+                    ind["macd"], ind["ema_20"], ind["ema_200"], ml_conf, db_win_rate
+                )
 
                 with state_lock:
-                    balance = bot_state["current_balance"]
-                
-                # Base Layer 1 (උදා: 20%)
-                base_layer_usd = max(6.0, balance * (risk_pct / 100)) 
-                base_qty = round(base_layer_usd / current_price, 4)
+                    bot_state["ai_decision"] = "CONFIRMED" if ai_approved else "REJECTED"
+                    bot_state["ai_reasoning"] = ai_reason
 
-                if base_qty > 0 and balance >= 6:
-                    order_success = True
-                    if mode == "real":
-                        res = spot_signed_request("/api/v3/order", "POST", {
-                            "symbol": symbol, "side": "BUY", "type": "MARKET", "quoteOrderQty": round(base_layer_usd, 2)
-                        })
-                        if "orderId" not in res:
-                            order_success = False
+                if ai_approved:
+                    with state_lock:
+                        balance = bot_state["current_balance"]
+                    
+                    base_layer_usd = max(6.0, balance * (risk_pct / 100)) 
+                    base_qty = round(base_layer_usd / current_price, 4)
 
-                    if order_success:
-                        entry_time_str = time.strftime('%H:%M:%S', time.localtime())
-                        initial_layers = [{
-                            "layer": 1,
-                            "price": current_price,
-                            "qty": base_qty,
-                            "cost": round(base_layer_usd, 2),
-                            "time": entry_time_str
-                        }]
-                        avg_price, total_qty, total_cost, tp_price, sl_price = recalculate_spot_dca_levels(initial_layers)
+                    if base_qty > 0 and balance >= 6:
+                        order_success = True
+                        if mode == "real":
+                            res = spot_signed_request("/api/v3/order", "POST", {
+                                "symbol": symbol, "side": "BUY", "type": "MARKET", "quoteOrderQty": round(base_layer_usd, 2)
+                            })
+                            if "orderId" not in res:
+                                order_success = False
 
-                        active_position = {
-                            "side": "SPOT LONG",
-                            "layers": initial_layers,
-                            "avg_price": avg_price,
-                            "total_qty": total_qty,
-                            "total_cost": total_cost,
-                            "tp_price": tp_price,
-                            "sl_price": sl_price,
-                            "entry_time": entry_time_str,
-                            "rsi": ind["rsi"], "macd": ind["macd"], "ml_conf": ml_conf,
-                            "trailing_tp_active": False
-                        }
+                        if order_success:
+                            entry_time_str = time.strftime('%H:%M:%S', time.localtime())
+                            initial_layers = [{
+                                "layer": 1,
+                                "price": current_price,
+                                "qty": base_qty,
+                                "cost": round(base_layer_usd, 2),
+                                "time": entry_time_str
+                            }]
+                            avg_price, total_qty, total_cost, tp_price, sl_price = recalculate_spot_dca_levels(initial_layers)
 
-                        with state_lock:
-                            bot_state["status_message"] = f"Binance Spot Base Layer 1 (ETH) ඇතුළත් විය!"
+                            active_position = {
+                                "side": "SPOT LONG",
+                                "layers": initial_layers,
+                                "avg_price": avg_price,
+                                "total_qty": total_qty,
+                                "total_cost": total_cost,
+                                "tp_price": tp_price,
+                                "sl_price": sl_price,
+                                "entry_time": entry_time_str,
+                                "rsi": ind["rsi"], "macd": ind["macd"], "ml_conf": ml_conf,
+                                "trailing_tp_active": False
+                            }
+
+                            with state_lock:
+                                bot_state["status_message"] = f"Binance Spot Base Layer 1 (ETH) ඇතුළත් විය!"
 
 def bot_worker():
     while True:
@@ -623,7 +678,7 @@ def start_bot():
         bot_state["mode"] = data.get("mode", "paper")
         bot_state["symbol"] = data.get("symbol", "ETHUSDT")
         bot_state["leverage"] = 1 
-        bot_state["risk_pct"] = float(data.get("risk_pct", 20.0))
+        bot_state["risk_pct"] = float(data.get("risk_pct", 15.0))
         
         if bot_state["mode"] == "paper":
             init_bal = float(data.get("start_balance", 1000.0))
