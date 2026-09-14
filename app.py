@@ -176,23 +176,18 @@ def get_db_stats_and_dynamic_filter():
         return 0, 0.0, 50.0
 
 PUBLIC_BINANCE_URLS = [
-    "https://api.binance.com",
     "https://data-api.binance.vision",
+    "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
     "https://api3.binance.com"
 ]
 
-HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/json"
-}
-
 def spot_public_request(endpoint, params=None):
     for base_url in PUBLIC_BINANCE_URLS:
         try:
             url = f"{base_url}{endpoint}"
-            res = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=8)
+            res = requests.get(url, params=params, timeout=3)
             if res.status_code == 200:
                 data = res.json()
                 if isinstance(data, list) and len(data) > 0:
@@ -201,7 +196,6 @@ def spot_public_request(endpoint, params=None):
                     return data
         except Exception:
             continue
-    print("[BINANCE WARNING] Binance Data endpoints response failed. Retrying in next cycle...")
     return None
 
 def spot_signed_request(endpoint, method="GET", params=None):
@@ -220,15 +214,15 @@ def spot_signed_request(endpoint, method="GET", params=None):
     signature = hmac.new(api_secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
     params["signature"] = signature
     
-    headers = {"X-MBX-APIKEY": api_key, "User-Agent": HTTP_HEADERS["User-Agent"]}
+    headers = {"X-MBX-APIKEY": api_key}
     
     for base_url in ["https://api.binance.com", "https://api1.binance.com", "https://api2.binance.com", "https://api3.binance.com"]:
         try:
             url = f"{base_url}{endpoint}"
             if method == "GET":
-                res = requests.get(url, params=params, headers=headers, timeout=5)
+                res = requests.get(url, params=params, headers=headers, timeout=3)
             elif method == "POST":
-                res = requests.post(url, data=params, headers=headers, timeout=5)
+                res = requests.post(url, data=params, headers=headers, timeout=3)
             
             if res.status_code == 200:
                 return res.json()
@@ -288,7 +282,7 @@ def train_and_predict_ml(df):
         features = ['rsi', 'ema_diff_20_200', 'price_ema20_diff', 'macd_diff', 'atr']
         clean_df = df.dropna().copy()
         
-        if len(clean_df) < 50:
+        if len(clean_df) < 100:
             return "NEUTRAL", 50.0
 
         X = clean_df[features][:-1]
@@ -313,7 +307,7 @@ def train_and_predict_ml(df):
 def get_klines_and_indicators(symbol):
     params = {"symbol": symbol, "interval": "3m", "limit": 250}
     data = spot_public_request("/api/v3/klines", params)
-    if not data or len(data) < 100:
+    if not data or len(data) < 200:
         return None, None, None
     
     df = pd.DataFrame(data, columns=[
@@ -393,9 +387,10 @@ def recalculate_spot_dca_levels(layers):
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
+    # Pro High Profit Take Profit Target: 1.8% above avg entry ($3.60 - $10.80+ Net Gains)
     tp_price = round(avg_price * 1.018, 4)
     lowest_price = min(l["price"] for l in layers)
-    sl_price = round(lowest_price * 0.992, 4)
+    sl_price = round(lowest_price * 0.992, 4) # Tight SL (0.8% below lowest layer = -$4.50 max loss)
 
     return round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), tp_price, sl_price
 
@@ -444,7 +439,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 with state_lock:
                     bot_state["current_balance"] = float(usdt_asset["free"])
 
-    # 1. SPOT DCA (LAYER 2 MAX LIMIT)
+    # 1. PRO HIGH PROFIT SPOT DCA + WIDE TRAILING GUARD
     if active_position:
         layers = active_position["layers"]
         avg_price = active_position["avg_price"]
@@ -453,6 +448,7 @@ def process_bot_logic(symbol, mode, risk_pct):
         sl_price = active_position["sl_price"]
         last_layer_price = layers[-1]["price"]
 
+        # Wide Trailing Profit Guard (+0.80% activation, 1.5*ATR breathing space for BIG RIDES)
         if current_price >= avg_price * 1.0080:
             min_profit_sl = round(avg_price * 1.0050, 4) 
             potential_trailing_sl = round(current_price - (1.5 * atr_val), 4)
@@ -463,12 +459,13 @@ def process_bot_logic(symbol, mode, risk_pct):
                 active_position["trailing_tp_active"] = True
                 sl_price = new_sl
 
+        # Safety Layer step distance
         layer_step_pct = max(0.008, (1.2 * atr_val) / current_price) 
 
-        # Only buy Layer 2 if RSI is Oversold (< 38) and current layer count < 2
+        # SAFETY LAYER CONDITIONAL FILTER: Only buy Layer 2 & 3 if RSI is Oversold (< 38)
         can_add_layer = False
-        if len(layers) < 2 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
-            if ind["rsi"] <= 38:
+        if len(layers) < 3 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
+            if ind["rsi"] <= 38: # Prevents buying layers during a continuous crash
                 can_add_layer = True
 
         if can_add_layer:
@@ -506,7 +503,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 active_position["sl_price"] = sl_price
 
         status_trail = " (Pro Trailing Active 🔥)" if active_position.get("trailing_tp_active", False) else ""
-        status_msg = f"SPOT DCA (LONG {len(layers)}/2 Layers){status_trail} | Avg: ${avg_price} | TP: ${tp_price} | Trailing/SL: ${sl_price}"
+        status_msg = f"SPOT DCA (LONG {len(layers)}/3 Layers){status_trail} | Avg: ${avg_price} | TP: ${tp_price} | Trailing/SL: ${sl_price}"
         with state_lock:
             bot_state["status_message"] = status_msg
 
@@ -540,7 +537,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             active_position = None
             last_trade_time = current_time
 
-    # 2. SPOT BASE ENTRY SIGNAL SEARCH
+    # 2. FLEXIBLE SPOT BASE ENTRY SIGNAL SEARCH
     else:
         cooldown_period = 10  
         if (current_time - last_trade_time) < cooldown_period:
@@ -615,7 +612,6 @@ def process_bot_logic(symbol, mode, risk_pct):
                                 bot_state["status_message"] = f"Binance Spot Base Layer 1 (ETH) ඇතුළත් විය!"
 
 def bot_worker():
-    print("[BOT ENGINE] Background worker loop started successfully.")
     while True:
         try:
             with state_lock:
@@ -625,7 +621,7 @@ def bot_worker():
             
             process_bot_logic(symbol, mode, risk_pct)
         except Exception as e:
-            print(f"[BOT CYCLE EXCEPTION]: {e}")
+            print(f"Bot cycle exception: {e}")
             
         time.sleep(2)
 
@@ -675,7 +671,7 @@ def export_csv():
 @app.route("/api/start", methods=["POST"])
 def start_bot():
     start_worker_safely()
-    data = request.json or {}
+    data = request.json
     with state_lock:
         bot_state["api_token"] = data.get("api_token", "")
         bot_state["api_secret"] = data.get("api_secret", "")
@@ -696,7 +692,7 @@ def start_bot():
 
 @app.route("/api/reset_demo", methods=["POST"])
 def reset_demo():
-    data = request.json or {}
+    data = request.json
     init_bal = float(data.get("start_balance", 1000.0))
     
     try:
@@ -734,6 +730,15 @@ def stop_bot():
 @app.route("/api/status")
 def get_status():
     start_worker_safely()
+    with state_lock:
+        symbol = bot_state["symbol"]
+        mode = bot_state["mode"]
+        risk_pct = bot_state["risk_pct"]
+
+    try:
+        process_bot_logic(symbol, mode, risk_pct)
+    except Exception:
+        pass
 
     with state_lock:
         active_pos_data = None
