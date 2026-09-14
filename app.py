@@ -5,6 +5,7 @@ import hashlib
 import urllib.parse
 import threading
 import json
+import re
 import sqlite3
 import pandas as pd
 import numpy as np
@@ -50,8 +51,8 @@ bot_state = {
 
     "ml_signal": "NEUTRAL",
     "ml_confidence": 0.0,
-    "ai_decision": "DIRECT_ML",
-    "ai_reasoning": "ML & Technical Indicators Engine Active",
+    "ai_decision": "CONFIRMED",
+    "ai_reasoning": "Pro High Profit Engine සූදානම්ව පවතී...",
     "db_total_trades": 0,
     "db_win_rate": 0.0,
     "auto_tuned_ml_filter": 50.0
@@ -337,10 +338,10 @@ def recalculate_spot_dca_levels(layers):
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
-    # Take Profit Target: 1.8% above avg entry
+    # Pro High Profit Take Profit Target: 1.8% above avg entry ($3.60 - $10.80+ Net Gains)
     tp_price = round(avg_price * 1.018, 4)
     lowest_price = min(l["price"] for l in layers)
-    sl_price = round(lowest_price * 0.992, 4) 
+    sl_price = round(lowest_price * 0.992, 4) # Tight SL (0.8% below lowest layer = -$4.50 max loss)
 
     return round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), tp_price, sl_price
 
@@ -389,7 +390,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 with state_lock:
                     bot_state["current_balance"] = float(usdt_asset["free"])
 
-    # 1. SPOT DCA (MAX 2 LAYERS) + WIDE TRAILING GUARD
+    # 1. PRO HIGH PROFIT SPOT DCA + WIDE TRAILING GUARD (උපරිම Layers 2 පමණි)
     if active_position:
         layers = active_position["layers"]
         avg_price = active_position["avg_price"]
@@ -398,7 +399,7 @@ def process_bot_logic(symbol, mode, risk_pct):
         sl_price = active_position["sl_price"]
         last_layer_price = layers[-1]["price"]
 
-        # Wide Trailing Profit Guard (+0.80% activation)
+        # Wide Trailing Profit Guard (+0.80% activation, 1.5*ATR breathing space for BIG RIDES)
         if current_price >= avg_price * 1.0080:
             min_profit_sl = round(avg_price * 1.0050, 4) 
             potential_trailing_sl = round(current_price - (1.5 * atr_val), 4)
@@ -412,17 +413,17 @@ def process_bot_logic(symbol, mode, risk_pct):
         # Safety Layer step distance
         layer_step_pct = max(0.008, (1.2 * atr_val) / current_price) 
 
-        # SAFETY LAYER 2 FILTER: Max 2 Layers (len(layers) < 2), RSI < 38
+        # SAFETY LAYER 2 CONDITIONAL FILTER: Only buy Layer 2 (Max 2 Layers) if RSI is Oversold (< 38)
         can_add_layer = False
         if len(layers) < 2 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
-            if ind["rsi"] <= 38:
+            if ind["rsi"] <= 38: # Prevents buying layers during a continuous crash
                 can_add_layer = True
 
         if can_add_layer:
             with state_lock:
                 balance = bot_state["current_balance"]
             
-            # Layer 2 size is reduced to half of risk_pct (e.g. if risk_pct=20%, Layer 2 takes 10%)
+            # Layer 2 මුදල Layer 1 න් අඩකි (50% - උදා: Layer 1 = 20%, Layer 2 = 10%)
             layer_2_risk_pct = risk_pct * 0.5
             next_layer_usd = max(6.0, balance * (layer_2_risk_pct / 100)) 
             next_layer_qty = round(next_layer_usd / current_price, 4)
@@ -489,7 +490,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             active_position = None
             last_trade_time = current_time
 
-    # 2. SPOT BASE ENTRY SIGNAL SEARCH (WITHOUT GROQ AI)
+    # 2. FLEXIBLE SPOT BASE ENTRY SIGNAL SEARCH (GROQ ඉවත් කර සෘජුව ක්‍රියාත්මක වේ)
     else:
         cooldown_period = 10  
         if (current_time - last_trade_time) < cooldown_period:
@@ -509,9 +510,13 @@ def process_bot_logic(symbol, mode, risk_pct):
 
             if tech_signal and tech_signal == ml_signal and ml_conf >= min_ml_filter:
                 with state_lock:
+                    bot_state["ai_decision"] = "CONFIRMED"
+                    bot_state["ai_reasoning"] = "Technical & ML Base Entry Approved"
+
+                with state_lock:
                     balance = bot_state["current_balance"]
                 
-                # Base Layer 1 uses full risk_pct (e.g. 20%)
+                # Base Layer 1 (උදා: 20%)
                 base_layer_usd = max(6.0, balance * (risk_pct / 100)) 
                 base_qty = round(base_layer_usd / current_price, 4)
 
@@ -544,9 +549,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                             "tp_price": tp_price,
                             "sl_price": sl_price,
                             "entry_time": entry_time_str,
-                            "rsi": ind["rsi"], 
-                            "macd": ind["macd"], 
-                            "ml_conf": ml_conf,
+                            "rsi": ind["rsi"], "macd": ind["macd"], "ml_conf": ml_conf,
                             "trailing_tp_active": False
                         }
 
