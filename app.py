@@ -16,6 +16,11 @@ app = Flask(__name__)
 
 DB_FILE = "bot_memory.db"
 
+# User-Agent header එක Binance Block වීම් වළක්වයි
+COMMON_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
 bot_state = {
     "is_running": True,   
     "api_token": "",      
@@ -28,7 +33,7 @@ bot_state = {
     "current_balance": 1000.0,
     
     "current_price": 0.0,
-    "status_message": "Pro Engine සූදානම්ව පවතී...",
+    "status_message": "Pro High Profit Spot DCA Engine සජීවීව ක්‍රියාත්මක වේ...",
     "wins": 0,
     "losses": 0,
     "total_trades": 0,
@@ -50,8 +55,8 @@ bot_state = {
 
     "ml_signal": "NEUTRAL",
     "ml_confidence": 0.0,
-    "ai_decision": "ACTIVE",
-    "ai_reasoning": "Trend-Aligned Multi-Indicator Engine",
+    "ai_decision": "CONFIRMED",
+    "ai_reasoning": "Standard Indicator & ML Engine Active",
     "db_total_trades": 0,
     "db_win_rate": 0.0,
     "auto_tuned_ml_filter": 50.0
@@ -61,11 +66,6 @@ active_position = None
 last_trade_time = 0
 state_lock = threading.Lock()
 worker_thread_started = False
-
-# Machine Learning Model Caching (CPU එක Free තබා ගැනීමට)
-cached_ml_model = None
-last_ml_train_time = 0
-ML_RETRAIN_INTERVAL = 900  # තත්පර 900 (විනාඩි 15කට වරක් Train වේ)
 
 def init_db():
     try:
@@ -90,8 +90,9 @@ def init_db():
         ''')
         conn.commit()
         conn.close()
+        print("[DATABASE] SQLite Memory Engine initialized successfully!")
     except Exception as e:
-        print(f"[DATABASE ERROR] {e}")
+        print(f"[DATABASE ERROR] Could not initialize DB: {e}")
 
 def load_db_history():
     try:
@@ -132,8 +133,10 @@ def load_db_history():
             bot_state["current_profit"] = tot_pnl
             bot_state["db_total_trades"] = tot_trades
             bot_state["db_win_rate"] = acc
+
+        print(f"[DATABASE] Auto-Loaded {len(history_trades)} historical trades into memory!")
     except Exception as e:
-        print(f"[DATABASE ERROR] {e}")
+        print(f"[DATABASE ERROR] Could not load DB history: {e}")
 
 init_db()
 load_db_history()
@@ -150,24 +153,41 @@ def save_trade_to_db(timestamp, symbol, side, avg_price, layers_count, tp, sl, r
         conn.close()
         load_db_history()
     except Exception as e:
-        print(f"[DATABASE ERROR] {e}")
+        print(f"[DATABASE ERROR] Could not save trade: {e}")
+
+def get_db_stats_and_dynamic_filter():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) FROM trade_history")
+        total_count, total_wins = cursor.fetchone()
+        conn.close()
+
+        total_trades = total_count if total_count else 0
+        historical_win_rate = round((total_wins / total_trades * 100), 1) if total_trades > 0 else 0.0
+        min_ml_threshold = 50.0  
+        return total_trades, historical_win_rate, min_ml_threshold
+    except Exception as e:
+        return 0, 0.0, 50.0
 
 PUBLIC_BINANCE_URLS = [
-    "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
-    "https://api3.binance.com"
+    "https://api3.binance.com",
+    "https://data-api.binance.vision"
 ]
 
 def spot_public_request(endpoint, params=None):
     for base_url in PUBLIC_BINANCE_URLS:
         try:
             url = f"{base_url}{endpoint}"
-            res = requests.get(url, params=params, timeout=3)
+            res = requests.get(url, params=params, headers=COMMON_HEADERS, timeout=4)
             if res.status_code == 200:
                 data = res.json()
-                if isinstance(data, (list, dict)):
+                if isinstance(data, list) and len(data) > 0:
+                    return data
+                elif isinstance(data, dict) and "code" not in data:
                     return data
         except Exception:
             continue
@@ -189,15 +209,15 @@ def spot_signed_request(endpoint, method="GET", params=None):
     signature = hmac.new(api_secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
     params["signature"] = signature
     
-    headers = {"X-MBX-APIKEY": api_key}
+    headers = {"X-MBX-APIKEY": api_key, "User-Agent": COMMON_HEADERS["User-Agent"]}
     
     for base_url in ["https://api.binance.com", "https://api1.binance.com", "https://api2.binance.com"]:
         try:
             url = f"{base_url}{endpoint}"
             if method == "GET":
-                res = requests.get(url, params=params, headers=headers, timeout=3)
+                res = requests.get(url, params=params, headers=headers, timeout=4)
             elif method == "POST":
-                res = requests.post(url, data=params, headers=headers, timeout=3)
+                res = requests.post(url, data=params, headers=headers, timeout=4)
             
             if res.status_code == 200:
                 return res.json()
@@ -207,9 +227,6 @@ def spot_signed_request(endpoint, method="GET", params=None):
     return {"error": "Connection error or blocked endpoint"}
 
 def train_and_predict_ml(df):
-    global cached_ml_model, last_ml_train_time
-    current_t = time.time()
-
     try:
         df['ema_diff_20_200'] = (df['ema_20'] - df['ema_200']) / df['close']
         df['price_ema20_diff'] = (df['close'] - df['ema_20']) / df['close']
@@ -222,20 +239,17 @@ def train_and_predict_ml(df):
         if len(clean_df) < 100:
             return "NEUTRAL", 50.0
 
-        # මාදිලිය නැවත Train කරන්නේ විනාඩි 15කට වරක් පමණි
-        if cached_ml_model is None or (current_t - last_ml_train_time) > ML_RETRAIN_INTERVAL:
-            X = clean_df[features][:-1]
-            y = clean_df['target'][:-1]
-            model = RandomForestClassifier(n_estimators=40, max_depth=4, random_state=42)
-            model.fit(X, y)
-            cached_ml_model = model
-            last_ml_train_time = current_t
-
+        X = clean_df[features][:-1]
+        y = clean_df['target'][:-1]
+        
+        model = RandomForestClassifier(n_estimators=50, max_depth=4, random_state=42)
+        model.fit(X, y)
+        
         latest_features = clean_df[features].iloc[-1:].values
-        probs = cached_ml_model.predict_proba(latest_features)[0]
+        probs = model.predict_proba(latest_features)[0]
         prob_up = probs[1] * 100
         
-        if prob_up >= 52.0:
+        if prob_up >= 50.0:
             return "LONG", round(prob_up, 1)
         else:
             return "NEUTRAL", round(prob_up, 1)
@@ -244,7 +258,8 @@ def train_and_predict_ml(df):
         return "NEUTRAL", 50.0
 
 def get_klines_and_indicators(symbol):
-    params = {"symbol": symbol, "interval": "3m", "limit": 250}
+    clean_symbol = str(symbol).replace("/", "").replace("-", "").strip().upper()
+    params = {"symbol": clean_symbol, "interval": "3m", "limit": 250}
     data = spot_public_request("/api/v3/klines", params)
     if not data or len(data) < 200:
         return None, None, None
@@ -321,18 +336,14 @@ def get_klines_and_indicators(symbol):
     
     return chart_candles, indicators, df
 
-def recalculate_spot_dca_levels(layers, atr_val):
+def recalculate_spot_dca_levels(layers):
     total_qty = sum(l["qty"] for l in layers)
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
-    # 1.8% Target Profit
     tp_price = round(avg_price * 1.018, 4)
     lowest_price = min(l["price"] for l in layers)
-
-    # Dynamic ATR Stop Loss: අවම වශයෙන් 1.6% හෝ 2.0x ATR ඉඩක් ලබාදේ (False Stop-outs වැළැක්වීමට)
-    dynamic_sl_dist = max(lowest_price * 0.016, 2.0 * atr_val)
-    sl_price = round(lowest_price - dynamic_sl_dist, 4) 
+    sl_price = round(lowest_price * 0.992, 4)
 
     return round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), tp_price, sl_price
 
@@ -345,9 +356,9 @@ def process_bot_logic(symbol, mode, risk_pct):
 
     current_time = time.time()
     current_price = ind["current_price"]
-    atr_val = ind["atr"] if ind["atr"] > 0 else (current_price * 0.005)
     
     ml_signal, ml_conf = train_and_predict_ml(df_klines)
+    db_total, db_win_rate, min_ml_filter = get_db_stats_and_dynamic_filter()
 
     with state_lock:
         bot_state["current_price"] = current_price
@@ -364,9 +375,14 @@ def process_bot_logic(symbol, mode, risk_pct):
         bot_state["current_atr"] = ind["atr"]
         bot_state["ml_signal"] = ml_signal
         bot_state["ml_confidence"] = ml_conf
+        bot_state["db_total_trades"] = db_total
+        bot_state["db_win_rate"] = db_win_rate
+        bot_state["auto_tuned_ml_filter"] = min_ml_filter
 
     if not bot_state["is_running"]:
         return
+
+    atr_val = ind["atr"] if ind["atr"] > 0 else (current_price * 0.005)
 
     if mode == "real":
         acc_info = spot_signed_request("/api/v3/account")
@@ -376,7 +392,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 with state_lock:
                     bot_state["current_balance"] = float(usdt_asset["free"])
 
-    # 1. POSITION MANAGEMENT & DCA (MAX 2 LAYERS)
+    # 1. SPOT DCA (MAX 2 LAYERS) + WIDE TRAILING GUARD
     if active_position:
         layers = active_position["layers"]
         avg_price = active_position["avg_price"]
@@ -385,10 +401,9 @@ def process_bot_logic(symbol, mode, risk_pct):
         sl_price = active_position["sl_price"]
         last_layer_price = layers[-1]["price"]
 
-        # Trailing Profit: +0.9% ලාභයක් ආ විට Breakeven (+0.3%) Lock කර ඉහළට Trail වේ
-        if current_price >= avg_price * 1.0090:
-            min_profit_sl = round(avg_price * 1.0030, 4) 
-            potential_trailing_sl = round(current_price - (1.4 * atr_val), 4)
+        if current_price >= avg_price * 1.0080:
+            min_profit_sl = round(avg_price * 1.0050, 4) 
+            potential_trailing_sl = round(current_price - (1.5 * atr_val), 4)
             new_sl = max(min_profit_sl, potential_trailing_sl)
 
             if new_sl > sl_price:
@@ -396,23 +411,20 @@ def process_bot_logic(symbol, mode, risk_pct):
                 active_position["trailing_tp_active"] = True
                 sl_price = new_sl
 
-        # Safety Layer step distance (අවම වශයෙන් 1.2% ක Dip එකක් ආ විට)
-        layer_step_pct = max(0.012, (1.5 * atr_val) / current_price) 
+        layer_step_pct = max(0.008, (1.2 * atr_val) / current_price) 
 
-        # LAYER 2 කොන්දේසිය: උපරිම Layer 2, Oversold (RSI < 35) සහ මිල Dip වූ විට පමණි
+        # LAYER 2 කොන්දේසිය (උපරිම Layer 2)
         can_add_layer = False
-        if len(layers) < 2 and current_price <= (last_layer_price * (1 - layer_step_pct)) and not active_position.get("trailing_tp_active", False):
-            if ind["rsi"] <= 35:
+        if len(layers) < 2 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
+            if ind["rsi"] <= 38:
                 can_add_layer = True
 
         if can_add_layer:
             with state_lock:
                 balance = bot_state["current_balance"]
             
-            # Layer 2 හි ප්‍රමාණය Layer 1 ට වඩා අඩකි (risk_pct * 0.5)
-            # අවම මුදල $11.0 (Binance Min Notional ආරක්ෂාව සඳහා)
-            layer_2_risk_pct = risk_pct * 0.5
-            next_layer_usd = max(11.0, balance * (layer_2_risk_pct / 100)) 
+            # Layer 2 මුදල Layer 1 ට වඩා අඩකි (risk_pct * 0.5)
+            next_layer_usd = max(6.0, balance * ((risk_pct * 0.5) / 100)) 
             next_layer_qty = round(next_layer_usd / current_price, 4)
 
             order_ok = True
@@ -433,7 +445,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                     "cost": round(next_layer_usd, 2),
                     "time": entry_time_str
                 })
-                avg_price, total_qty, total_cost, tp_price, sl_price = recalculate_spot_dca_levels(layers, atr_val)
+                avg_price, total_qty, total_cost, tp_price, sl_price = recalculate_spot_dca_levels(layers)
                 
                 active_position["layers"] = layers
                 active_position["avg_price"] = avg_price
@@ -442,8 +454,8 @@ def process_bot_logic(symbol, mode, risk_pct):
                 active_position["tp_price"] = tp_price
                 active_position["sl_price"] = sl_price
 
-        status_trail = " (Trailing Active 🔥)" if active_position.get("trailing_tp_active", False) else ""
-        status_msg = f"SPOT DCA (LONG {len(layers)}/2 Layers){status_trail} | Avg: ${avg_price} | TP: ${tp_price} | SL: ${sl_price}"
+        status_trail = " (Pro Trailing Active 🔥)" if active_position.get("trailing_tp_active", False) else ""
+        status_msg = f"SPOT DCA (LONG {len(layers)}/2 Layers){status_trail} | Avg: ${avg_price} | TP: ${tp_price} | Trailing/SL: ${sl_price}"
         with state_lock:
             bot_state["status_message"] = status_msg
 
@@ -462,10 +474,10 @@ def process_bot_logic(symbol, mode, risk_pct):
             est_binance_spot_fee = (notional_val * 2) * 0.0010 
             net_pnl = round(gross_pnl - est_binance_spot_fee, 2)
 
-            if net_pnl >= 0:
-                outcome = f"ජයග්‍රහණය (+${net_pnl})"
+            if active_position.get("trailing_tp_active", False) or net_pnl >= 0:
+                outcome = f"ජයග්‍රහණය (Pro Trailing Hit 🔥 - {len(layers)} Layers)"
             else:
-                outcome = f"පරාජය (SL Hit: ${net_pnl})"
+                outcome = f"පරාජය (Emergency SL Hit)"
 
             if mode == "real":
                 spot_signed_request("/api/v3/order", "POST", {
@@ -477,37 +489,31 @@ def process_bot_logic(symbol, mode, risk_pct):
             active_position = None
             last_trade_time = current_time
 
-    # 2. TREND-ALIGNED ENTRY (Downtrends වලදී Trade ගැනීම වළක්වයි)
+    # 2. BASE ENTRY SIGNAL SEARCH (GROQ ඉවත් කර සෘජුව ක්‍රියාත්මක වේ)
     else:
-        cooldown_period = 15  
+        cooldown_period = 10  
         if (current_time - last_trade_time) < cooldown_period:
             rem_sec = int(cooldown_period - (current_time - last_trade_time))
             with state_lock:
                 bot_state["status_message"] = f"විරාමය (Cooldown): තව තත්පර {rem_sec}..."
         else:
             with state_lock:
-                bot_state["status_message"] = "Trend & Pullback සංඥා නිරීක්ෂණය වේ..."
+                bot_state["status_message"] = f"Pro Base Entry Signal (ML Filter: {min_ml_filter}%) නිරීක්ෂණය වේ..."
             
             tech_signal = None
             macd_diff = ind["macd"] - ind["macd_signal"]
 
-            # Macro Trend Condition:
-            # 1. මිල 200 EMA එකට ඉහළින් තිබිය යුතුය (Bullish Market පමණි)
-            # 2. RSI 38 ත් 65 ත් අතර Pullback කලාපයක තිබිය යුතුය
-            # 3. EMA 20 > EMA 50 හෝ MACD Bullish Cross එකක් තිබිය යුතුය
-            if current_price > ind["ema_200"]:
-                if (ind["ema_20"] > ind["ema_50"] or macd_diff > 0) and (38 <= ind["rsi"] <= 65):
-                    tech_signal = "LONG"
+            if ((ind["ema_20"] > ind["ema_50"] or macd_diff > 0) and (30 <= ind["rsi"] <= 72)):
+                tech_signal = "LONG"
 
-            if tech_signal and tech_signal == ml_signal and ml_conf >= 52.0:
+            if tech_signal and tech_signal == ml_signal and ml_conf >= min_ml_filter:
                 with state_lock:
                     balance = bot_state["current_balance"]
                 
-                # Layer 1 සඳහා Base Layer Amount (අවම වශයෙන් $11.0)
-                base_layer_usd = max(11.0, balance * (risk_pct / 100)) 
+                base_layer_usd = max(6.0, balance * (risk_pct / 100)) 
                 base_qty = round(base_layer_usd / current_price, 4)
 
-                if base_qty > 0 and balance >= 11.0:
+                if base_qty > 0 and balance >= 6:
                     order_success = True
                     if mode == "real":
                         res = spot_signed_request("/api/v3/order", "POST", {
@@ -525,7 +531,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                             "cost": round(base_layer_usd, 2),
                             "time": entry_time_str
                         }]
-                        avg_price, total_qty, total_cost, tp_price, sl_price = recalculate_spot_dca_levels(initial_layers, atr_val)
+                        avg_price, total_qty, total_cost, tp_price, sl_price = recalculate_spot_dca_levels(initial_layers)
 
                         active_position = {
                             "side": "SPOT LONG",
@@ -543,7 +549,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                         }
 
                         with state_lock:
-                            bot_state["status_message"] = f"Spot Base Layer 1 සාර්ථකව ක්‍රියාත්මක විය!"
+                            bot_state["status_message"] = f"Binance Spot Base Layer 1 ({symbol}) ඇතුළත් විය!"
 
 def bot_worker():
     while True:
@@ -555,7 +561,7 @@ def bot_worker():
             
             process_bot_logic(symbol, mode, risk_pct)
         except Exception as e:
-            print(f"Bot cycle error: {e}")
+            print(f"Bot cycle exception: {e}")
             
         time.sleep(2)
 
@@ -610,7 +616,8 @@ def start_bot():
         bot_state["api_token"] = data.get("api_token", "")
         bot_state["api_secret"] = data.get("api_secret", "")
         bot_state["mode"] = data.get("mode", "paper")
-        bot_state["symbol"] = data.get("symbol", "ETHUSDT")
+        raw_symbol = data.get("symbol", "ETHUSDT")
+        bot_state["symbol"] = str(raw_symbol).replace("/", "").replace("-", "").strip().upper()
         bot_state["leverage"] = 1 
         bot_state["risk_pct"] = float(data.get("risk_pct", 20.0))
         
@@ -620,9 +627,9 @@ def start_bot():
             bot_state["current_balance"] = init_bal
             
         bot_state["is_running"] = True
-        bot_state["status_message"] = f"Spot Pro Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
+        bot_state["status_message"] = f"Binance Spot Pro High Profit Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
         
-    return jsonify({"status": "success", "message": "Bot සාර්ථකව ආරම්භ විය!"})
+    return jsonify({"status": "success", "message": "Pro High Profit Spot Bot සාර්ථකව ආරම්භ විය!"})
 
 @app.route("/api/reset_demo", methods=["POST"])
 def reset_demo():
@@ -636,7 +643,7 @@ def reset_demo():
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"[DATABASE ERROR] {e}")
+        print(f"[DATABASE ERROR] Could not clear DB: {e}")
 
     with state_lock:
         bot_state["virtual_balance"] = init_bal
@@ -663,6 +670,17 @@ def stop_bot():
 @app.route("/api/status")
 def get_status():
     start_worker_safely()
+    with state_lock:
+        symbol = bot_state["symbol"]
+        mode = bot_state["mode"]
+        risk_pct = bot_state["risk_pct"]
+
+    # UI එකට Chart එක සහ Indicators වහාම Load වීම සඳහා
+    try:
+        process_bot_logic(symbol, mode, risk_pct)
+    except Exception:
+        pass
+
     with state_lock:
         active_pos_data = None
         available_free_balance = bot_state["current_balance"]
