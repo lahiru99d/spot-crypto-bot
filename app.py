@@ -9,14 +9,13 @@ import sqlite3
 import pandas as pd
 import numpy as np
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, make_response
 from sklearn.ensemble import RandomForestClassifier
 
 app = Flask(__name__)
 
 DB_FILE = "bot_memory.db"
 
-# User-Agent header එක Binance Block වීම් වළක්වයි
 COMMON_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
@@ -67,6 +66,14 @@ last_trade_time = 0
 state_lock = threading.Lock()
 worker_thread_started = False
 
+# Browser Cache වීම වැළැක්වීමට
+@app.after_request
+def add_header(response):
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '-1'
+    return response
+
 def init_db():
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -90,9 +97,8 @@ def init_db():
         ''')
         conn.commit()
         conn.close()
-        print("[DATABASE] SQLite Memory Engine initialized successfully!")
     except Exception as e:
-        print(f"[DATABASE ERROR] Could not initialize DB: {e}")
+        print(f"[DATABASE ERROR] {e}")
 
 def load_db_history():
     try:
@@ -133,10 +139,8 @@ def load_db_history():
             bot_state["current_profit"] = tot_pnl
             bot_state["db_total_trades"] = tot_trades
             bot_state["db_win_rate"] = acc
-
-        print(f"[DATABASE] Auto-Loaded {len(history_trades)} historical trades into memory!")
     except Exception as e:
-        print(f"[DATABASE ERROR] Could not load DB history: {e}")
+        print(f"[DATABASE ERROR] {e}")
 
 init_db()
 load_db_history()
@@ -153,29 +157,14 @@ def save_trade_to_db(timestamp, symbol, side, avg_price, layers_count, tp, sl, r
         conn.close()
         load_db_history()
     except Exception as e:
-        print(f"[DATABASE ERROR] Could not save trade: {e}")
-
-def get_db_stats_and_dynamic_filter():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) FROM trade_history")
-        total_count, total_wins = cursor.fetchone()
-        conn.close()
-
-        total_trades = total_count if total_count else 0
-        historical_win_rate = round((total_wins / total_trades * 100), 1) if total_trades > 0 else 0.0
-        min_ml_threshold = 50.0  
-        return total_trades, historical_win_rate, min_ml_threshold
-    except Exception as e:
-        return 0, 0.0, 50.0
+        print(f"[DATABASE ERROR] {e}")
 
 PUBLIC_BINANCE_URLS = [
+    "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://data-api.binance.vision"
+    "https://api3.binance.com"
 ]
 
 def spot_public_request(endpoint, params=None):
@@ -189,6 +178,8 @@ def spot_public_request(endpoint, params=None):
                     return data
                 elif isinstance(data, dict) and "code" not in data:
                     return data
+            elif res.status_code in [429, 418]:
+                print(f"[BINANCE RATE LIMIT] Status: {res.status_code} on {base_url}. Pausing...")
         except Exception:
             continue
     return None
@@ -242,7 +233,7 @@ def train_and_predict_ml(df):
         X = clean_df[features][:-1]
         y = clean_df['target'][:-1]
         
-        model = RandomForestClassifier(n_estimators=50, max_depth=4, random_state=42)
+        model = RandomForestClassifier(n_estimators=30, max_depth=4, random_state=42)
         model.fit(X, y)
         
         latest_features = clean_df[features].iloc[-1:].values
@@ -358,7 +349,6 @@ def process_bot_logic(symbol, mode, risk_pct):
     current_price = ind["current_price"]
     
     ml_signal, ml_conf = train_and_predict_ml(df_klines)
-    db_total, db_win_rate, min_ml_filter = get_db_stats_and_dynamic_filter()
 
     with state_lock:
         bot_state["current_price"] = current_price
@@ -375,9 +365,6 @@ def process_bot_logic(symbol, mode, risk_pct):
         bot_state["current_atr"] = ind["atr"]
         bot_state["ml_signal"] = ml_signal
         bot_state["ml_confidence"] = ml_conf
-        bot_state["db_total_trades"] = db_total
-        bot_state["db_win_rate"] = db_win_rate
-        bot_state["auto_tuned_ml_filter"] = min_ml_filter
 
     if not bot_state["is_running"]:
         return
@@ -392,7 +379,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 with state_lock:
                     bot_state["current_balance"] = float(usdt_asset["free"])
 
-    # 1. SPOT DCA (MAX 2 LAYERS) + WIDE TRAILING GUARD
+    # 1. SPOT DCA (MAX 2 LAYERS)
     if active_position:
         layers = active_position["layers"]
         avg_price = active_position["avg_price"]
@@ -413,7 +400,7 @@ def process_bot_logic(symbol, mode, risk_pct):
 
         layer_step_pct = max(0.008, (1.2 * atr_val) / current_price) 
 
-        # LAYER 2 කොන්දේසිය (උපරිම Layer 2)
+        # LAYER 2 කොන්දේසිය
         can_add_layer = False
         if len(layers) < 2 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
             if ind["rsi"] <= 38:
@@ -423,7 +410,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             with state_lock:
                 balance = bot_state["current_balance"]
             
-            # Layer 2 මුදල Layer 1 ට වඩා අඩකි (risk_pct * 0.5)
+            # Layer 2 හි ප්‍රමාණය Layer 1 ට වඩා අඩකි (50%)
             next_layer_usd = max(6.0, balance * ((risk_pct * 0.5) / 100)) 
             next_layer_qty = round(next_layer_usd / current_price, 4)
 
@@ -489,7 +476,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             active_position = None
             last_trade_time = current_time
 
-    # 2. BASE ENTRY SIGNAL SEARCH (GROQ ඉවත් කර සෘජුව ක්‍රියාත්මක වේ)
+    # 2. BASE ENTRY SIGNAL SEARCH
     else:
         cooldown_period = 10  
         if (current_time - last_trade_time) < cooldown_period:
@@ -498,7 +485,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 bot_state["status_message"] = f"විරාමය (Cooldown): තව තත්පර {rem_sec}..."
         else:
             with state_lock:
-                bot_state["status_message"] = f"Pro Base Entry Signal (ML Filter: {min_ml_filter}%) නිරීක්ෂණය වේ..."
+                bot_state["status_message"] = "Pro Base Entry Signal නිරීක්ෂණය වේ..."
             
             tech_signal = None
             macd_diff = ind["macd"] - ind["macd_signal"]
@@ -506,7 +493,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             if ((ind["ema_20"] > ind["ema_50"] or macd_diff > 0) and (30 <= ind["rsi"] <= 72)):
                 tech_signal = "LONG"
 
-            if tech_signal and tech_signal == ml_signal and ml_conf >= min_ml_filter:
+            if tech_signal and tech_signal == ml_signal and ml_conf >= 50.0:
                 with state_lock:
                     balance = bot_state["current_balance"]
                 
@@ -552,6 +539,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                             bot_state["status_message"] = f"Binance Spot Base Layer 1 ({symbol}) ඇතුළත් විය!"
 
 def bot_worker():
+    print("[BOT WORKER] Background analysis loop started successfully!")
     while True:
         try:
             with state_lock:
@@ -561,9 +549,9 @@ def bot_worker():
             
             process_bot_logic(symbol, mode, risk_pct)
         except Exception as e:
-            print(f"Bot cycle exception: {e}")
+            print(f"[BOT CYCLE EXCEPTION] {e}")
             
-        time.sleep(2)
+        time.sleep(3)  # තත්පර 3 ක කාල පරතරය Binance Rate Limit වළක්වයි
 
 def start_worker_safely():
     global worker_thread_started
@@ -573,6 +561,14 @@ def start_worker_safely():
                 t = threading.Thread(target=bot_worker, daemon=True)
                 t.start()
                 worker_thread_started = True
+
+# Server එක Start වන විටම පළමු Data Load එක සිදුකිරීම (Chart එක Black වීම වළක්වයි)
+try:
+    print("[INIT] Fetching initial market data...")
+    process_bot_logic("ETHUSDT", "paper", 20.0)
+    print("[INIT] Initial data loaded successfully!")
+except Exception as e:
+    print(f"[INIT ERROR] {e}")
 
 # ----------------- FLASK ROUTES -----------------
 @app.route("/")
@@ -627,9 +623,9 @@ def start_bot():
             bot_state["current_balance"] = init_bal
             
         bot_state["is_running"] = True
-        bot_state["status_message"] = f"Binance Spot Pro High Profit Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
+        bot_state["status_message"] = f"Binance Spot Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
         
-    return jsonify({"status": "success", "message": "Pro High Profit Spot Bot සාර්ථකව ආරම්භ විය!"})
+    return jsonify({"status": "success", "message": "Bot සාර්ථකව ආරම්භ විය!"})
 
 @app.route("/api/reset_demo", methods=["POST"])
 def reset_demo():
@@ -643,7 +639,7 @@ def reset_demo():
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"[DATABASE ERROR] Could not clear DB: {e}")
+        print(f"[DATABASE ERROR] {e}")
 
     with state_lock:
         bot_state["virtual_balance"] = init_bal
@@ -670,16 +666,6 @@ def stop_bot():
 @app.route("/api/status")
 def get_status():
     start_worker_safely()
-    with state_lock:
-        symbol = bot_state["symbol"]
-        mode = bot_state["mode"]
-        risk_pct = bot_state["risk_pct"]
-
-    # UI එකට Chart එක සහ Indicators වහාම Load වීම සඳහා
-    try:
-        process_bot_logic(symbol, mode, risk_pct)
-    except Exception:
-        pass
 
     with state_lock:
         active_pos_data = None
