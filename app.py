@@ -183,15 +183,16 @@ PUBLIC_BINANCE_URLS = [
     "https://api3.binance.com"
 ]
 
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json"
 }
 
 def spot_public_request(endpoint, params=None):
     for base_url in PUBLIC_BINANCE_URLS:
         try:
             url = f"{base_url}{endpoint}"
-            res = requests.get(url, params=params, headers=DEFAULT_HEADERS, timeout=6)
+            res = requests.get(url, params=params, headers=HTTP_HEADERS, timeout=8)
             if res.status_code == 200:
                 data = res.json()
                 if isinstance(data, list) and len(data) > 0:
@@ -200,6 +201,7 @@ def spot_public_request(endpoint, params=None):
                     return data
         except Exception:
             continue
+    print("[BINANCE WARNING] Binance Data endpoints response failed. Retrying in next cycle...")
     return None
 
 def spot_signed_request(endpoint, method="GET", params=None):
@@ -218,7 +220,7 @@ def spot_signed_request(endpoint, method="GET", params=None):
     signature = hmac.new(api_secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
     params["signature"] = signature
     
-    headers = {"X-MBX-APIKEY": api_key, "User-Agent": DEFAULT_HEADERS["User-Agent"]}
+    headers = {"X-MBX-APIKEY": api_key, "User-Agent": HTTP_HEADERS["User-Agent"]}
     
     for base_url in ["https://api.binance.com", "https://api1.binance.com", "https://api2.binance.com", "https://api3.binance.com"]:
         try:
@@ -286,7 +288,7 @@ def train_and_predict_ml(df):
         features = ['rsi', 'ema_diff_20_200', 'price_ema20_diff', 'macd_diff', 'atr']
         clean_df = df.dropna().copy()
         
-        if len(clean_df) < 30:
+        if len(clean_df) < 50:
             return "NEUTRAL", 50.0
 
         X = clean_df[features][:-1]
@@ -391,7 +393,6 @@ def recalculate_spot_dca_levels(layers):
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
-    # Pro High Profit Take Profit Target: 1.8% above avg entry
     tp_price = round(avg_price * 1.018, 4)
     lowest_price = min(l["price"] for l in layers)
     sl_price = round(lowest_price * 0.992, 4)
@@ -443,7 +444,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 with state_lock:
                     bot_state["current_balance"] = float(usdt_asset["free"])
 
-    # 1. SPOT DCA (LAYER 2 LIMIT) + WIDE TRAILING GUARD
+    # 1. SPOT DCA (LAYER 2 MAX LIMIT)
     if active_position:
         layers = active_position["layers"]
         avg_price = active_position["avg_price"]
@@ -464,7 +465,7 @@ def process_bot_logic(symbol, mode, risk_pct):
 
         layer_step_pct = max(0.008, (1.2 * atr_val) / current_price) 
 
-        # Only buy Layer 2 if RSI is Oversold (< 38) and max layers < 2
+        # Only buy Layer 2 if RSI is Oversold (< 38) and current layer count < 2
         can_add_layer = False
         if len(layers) < 2 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
             if ind["rsi"] <= 38:
@@ -614,6 +615,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                                 bot_state["status_message"] = f"Binance Spot Base Layer 1 (ETH) ඇතුළත් විය!"
 
 def bot_worker():
+    print("[BOT ENGINE] Background worker loop started successfully.")
     while True:
         try:
             with state_lock:
@@ -623,7 +625,7 @@ def bot_worker():
             
             process_bot_logic(symbol, mode, risk_pct)
         except Exception as e:
-            print(f"Bot cycle exception: {e}")
+            print(f"[BOT CYCLE EXCEPTION]: {e}")
             
         time.sleep(2)
 
@@ -673,7 +675,7 @@ def export_csv():
 @app.route("/api/start", methods=["POST"])
 def start_bot():
     start_worker_safely()
-    data = request.json
+    data = request.json or {}
     with state_lock:
         bot_state["api_token"] = data.get("api_token", "")
         bot_state["api_secret"] = data.get("api_secret", "")
@@ -694,7 +696,7 @@ def start_bot():
 
 @app.route("/api/reset_demo", methods=["POST"])
 def reset_demo():
-    data = request.json
+    data = request.json or {}
     init_bal = float(data.get("start_balance", 1000.0))
     
     try:
