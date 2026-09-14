@@ -462,9 +462,9 @@ def process_bot_logic(symbol, mode, risk_pct):
         # Safety Layer step distance
         layer_step_pct = max(0.008, (1.2 * atr_val) / current_price) 
 
-        # SAFETY LAYER CONDITIONAL FILTER: Only buy Layer 2 & 3 if RSI is Oversold (< 38)
+        # SAFETY LAYER CONDITIONAL FILTER: Only buy Layer 2 if RSI is Oversold (< 38)
         can_add_layer = False
-        if len(layers) < 3 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
+        if len(layers) < 2 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
             if ind["rsi"] <= 38: # Prevents buying layers during a continuous crash
                 can_add_layer = True
 
@@ -503,7 +503,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 active_position["sl_price"] = sl_price
 
         status_trail = " (Pro Trailing Active 🔥)" if active_position.get("trailing_tp_active", False) else ""
-        status_msg = f"SPOT DCA (LONG {len(layers)}/3 Layers){status_trail} | Avg: ${avg_price} | TP: ${tp_price} | Trailing/SL: ${sl_price}"
+        status_msg = f"SPOT DCA (LONG {len(layers)}/2 Layers){status_trail} | Avg: ${avg_price} | TP: ${tp_price} | Trailing/SL: ${sl_price}"
         with state_lock:
             bot_state["status_message"] = status_msg
 
