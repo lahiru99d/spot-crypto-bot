@@ -387,10 +387,9 @@ def recalculate_spot_dca_levels(layers):
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
-    # Pro High Profit Take Profit Target: 1.8% above avg entry ($3.60 - $10.80+ Net Gains)
     tp_price = round(avg_price * 1.018, 4)
     lowest_price = min(l["price"] for l in layers)
-    sl_price = round(lowest_price * 0.992, 4) # Tight SL (0.8% below lowest layer = -$4.50 max loss)
+    sl_price = round(lowest_price * 0.992, 4) 
 
     return round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), tp_price, sl_price
 
@@ -448,7 +447,6 @@ def process_bot_logic(symbol, mode, risk_pct):
         sl_price = active_position["sl_price"]
         last_layer_price = layers[-1]["price"]
 
-        # Wide Trailing Profit Guard (+0.80% activation, 1.5*ATR breathing space for BIG RIDES)
         if current_price >= avg_price * 1.0080:
             min_profit_sl = round(avg_price * 1.0050, 4) 
             potential_trailing_sl = round(current_price - (1.5 * atr_val), 4)
@@ -459,13 +457,11 @@ def process_bot_logic(symbol, mode, risk_pct):
                 active_position["trailing_tp_active"] = True
                 sl_price = new_sl
 
-        # Safety Layer step distance
         layer_step_pct = max(0.008, (1.2 * atr_val) / current_price) 
 
-        # SAFETY LAYER CONDITIONAL FILTER: Only buy Layer 2 if RSI is Oversold (< 38)
         can_add_layer = False
         if len(layers) < 2 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
-            if ind["rsi"] <= 38: # Prevents buying layers during a continuous crash
+            if ind["rsi"] <= 38: 
                 can_add_layer = True
 
         if can_add_layer:
@@ -551,9 +547,11 @@ def process_bot_logic(symbol, mode, risk_pct):
             tech_signal = None
             macd_diff = ind["macd"] - ind["macd_signal"]
 
-            if ((ind["ema_20"] > ind["ema_50"] or macd_diff > 0) and 
-                (30 <= ind["rsi"] <= 72)):
-                tech_signal = "LONG"
+            # >>> DOWN TREND GUARD: Down trend එකකදී (current_price <= EMA 200) Loss වීම නැවැත්වීමට Uptrend එකකදී පමණක් Long Signal ලබා ගනී <<<
+            if current_price > ind["ema_200"]:
+                if ((ind["ema_20"] > ind["ema_50"] or macd_diff > 0) and 
+                    (30 <= ind["rsi"] <= 72)):
+                    tech_signal = "LONG"
 
             if tech_signal and tech_signal == ml_signal and ml_conf >= min_ml_filter:
                 with state_lock:
