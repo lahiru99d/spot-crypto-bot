@@ -21,12 +21,9 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 last_groq_call_time = 0
-GROQ_COOLDOWN_SECONDS = 30  
+GROQ_COOLDOWN_SECONDS = 45  
 
 DB_FILE = "bot_memory.db"
-
-# Multi-Pair Watchlist
-SCAN_PAIRS = ["ETHUSDT", "SOLUSDT", "BTCUSDT"]
 
 bot_state = {
     "is_running": True,   
@@ -40,7 +37,7 @@ bot_state = {
     "current_balance": 1000.0,
     
     "current_price": 0.0,
-    "status_message": "Ultra Scalp Live Engine ආරම්භ වෙමින් පවතී...",
+    "status_message": "Pro High Profit Spot DCA Engine සජීවීව ක්‍රියාත්මක වේ...",
     "wins": 0,
     "losses": 0,
     "total_trades": 0,
@@ -63,7 +60,7 @@ bot_state = {
     "ml_signal": "NEUTRAL",
     "ml_confidence": 0.0,
     "ai_decision": "WAITING",
-    "ai_reasoning": "Ultra Scalp Scanner සූදානම්...",
+    "ai_reasoning": "Pro High Profit Engine සූදානම්ව පවතී...",
     "db_total_trades": 0,
     "db_win_rate": 0.0,
     "auto_tuned_ml_filter": 50.0
@@ -73,7 +70,6 @@ active_position = None
 last_trade_time = 0
 state_lock = threading.Lock()
 worker_thread_started = False
-ml_models_cache = {}
 
 def init_db():
     try:
@@ -117,7 +113,7 @@ def load_db_history():
             timestamp, symbol, side, avg_price, layers_count, tp, sl, pnl, outcome = row
             history_trades.append({
                 "time": timestamp,
-                "type": f"{symbol} {side} ({layers_count}L)",
+                "type": f"{side} ({layers_count} Layers)",
                 "price": avg_price,
                 "tp": tp,
                 "sl": sl,
@@ -158,23 +154,27 @@ def save_trade_to_db(timestamp, symbol, side, avg_price, layers_count, tp, sl, r
         conn.close()
         load_db_history()
     except Exception as e:
-        print(f"[DATABASE ERROR] Could not save trade: {e}")
+        print(f"[DATABASE ERROR] {e}")
 
 PUBLIC_BINANCE_URLS = [
+    "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
-    "https://data-api.binance.vision"
+    "https://api3.binance.com"
 ]
 
 def spot_public_request(endpoint, params=None):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     for base_url in PUBLIC_BINANCE_URLS:
         try:
             url = f"{base_url}{endpoint}"
-            res = requests.get(url, params=params, timeout=3.0)
+            res = requests.get(url, params=params, headers=headers, timeout=4.0)
             if res.status_code == 200:
                 data = res.json()
-                if isinstance(data, (list, dict)):
+                if isinstance(data, list) and len(data) > 0:
+                    return data
+                elif isinstance(data, dict) and "code" not in data:
                     return data
         except Exception:
             continue
@@ -196,27 +196,27 @@ def spot_signed_request(endpoint, method="GET", params=None):
     signature = hmac.new(api_secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
     params["signature"] = signature
     
-    headers = {"X-MBX-APIKEY": api_key}
+    headers = {"X-MBX-APIKEY": api_key, "User-Agent": "Mozilla/5.0"}
     
     for base_url in ["https://api.binance.com", "https://api1.binance.com", "https://api2.binance.com"]:
         try:
             url = f"{base_url}{endpoint}"
             if method == "GET":
-                res = requests.get(url, params=params, headers=headers, timeout=3.0)
+                res = requests.get(url, params=params, headers=headers, timeout=4.0)
             elif method == "POST":
-                res = requests.post(url, data=params, headers=headers, timeout=3.0)
+                res = requests.post(url, data=params, headers=headers, timeout=4.0)
             if res.status_code == 200:
                 return res.json()
         except Exception:
             continue
     return {"error": "Connection error"}
 
-def analyze_trade_with_groq_ai(symbol, price, rsi, macd, ml_conf):
+def analyze_trade_with_groq_ai(signal, price, rsi, macd, ema20, ema200, ml_conf, hist_win_rate):
     global last_groq_call_time
     current_time = time.time()
     
     if (current_time - last_groq_call_time) < GROQ_COOLDOWN_SECONDS:
-        return True, "Groq Fast Pass: Scalp signal approved."
+        return True, "Groq Limit Protection: Approved."
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -224,8 +224,8 @@ def analyze_trade_with_groq_ai(symbol, price, rsi, macd, ml_conf):
     }
 
     prompt = f"""
-    Validate Scalp Entry: Symbol={symbol}, Price={price}, RSI={rsi}, MACD={macd}, ML Conf={ml_conf}%.
-    Respond in JSON only: {{"decision": "CONFIRM" or "REJECT", "reason": "Short summary"}}
+    Validate base entry: Signal={signal}, Price={price}, RSI={rsi}, MACD={macd}, ML Conf={ml_conf}%
+    Respond ONLY in JSON: {{"decision": "CONFIRM" or "REJECT", "reason": "Short summary"}}
     """
 
     payload = {
@@ -237,19 +237,19 @@ def analyze_trade_with_groq_ai(symbol, price, rsi, macd, ml_conf):
 
     try:
         last_groq_call_time = time.time()
-        res = requests.post(GROQ_URL, json=payload, headers=headers, timeout=3.5)
+        res = requests.post(GROQ_URL, json=payload, headers=headers, timeout=4.0)
         if res.status_code == 200:
-            content = res.json()['choices'][0]['message']['content']
+            result = res.json()
+            content = result['choices'][0]['message']['content']
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
             if json_match:
                 parsed = json.loads(json_match.group(0))
-                return parsed.get("decision") == "CONFIRM", parsed.get("reason", "AI Approved Scalp")
+                return parsed.get("decision") == "CONFIRM", parsed.get("reason", "AI Approved")
         return True, "Groq AI bypass."
     except Exception:
         return True, "Groq AI bypass."
 
-def train_and_predict_ml(symbol, df):
-    global ml_models_cache
+def train_and_predict_ml(df):
     try:
         df['ema_diff_20_200'] = (df['ema_20'] - df['ema_200']) / df['close']
         df['price_ema20_diff'] = (df['close'] - df['ema_20']) / df['close']
@@ -262,18 +262,12 @@ def train_and_predict_ml(symbol, df):
         if len(clean_df) < 100:
             return "NEUTRAL", 50.0
 
-        current_time = time.time()
-        model_info = ml_models_cache.get(symbol)
+        X = clean_df[features][:-1]
+        y = clean_df['target'][:-1]
         
-        if not model_info or (current_time - model_info["time"] > 1800):
-            X = clean_df[features][:-1]
-            y = clean_df['target'][:-1]
-            model = RandomForestClassifier(n_estimators=45, max_depth=4, random_state=42)
-            model.fit(X, y)
-            ml_models_cache[symbol] = {"model": model, "time": current_time}
-        else:
-            model = model_info["model"]
-
+        model = RandomForestClassifier(n_estimators=45, max_depth=4, random_state=42)
+        model.fit(X, y)
+        
         latest_features = clean_df[features].iloc[-1:].values
         probs = model.predict_proba(latest_features)[0]
         
@@ -374,51 +368,55 @@ def recalculate_spot_dca_levels(layers):
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
-    tp_price = round(avg_price * 1.0095, 4)
+    tp_price = round(avg_price * 1.018, 4)
     lowest_price = min(l["price"] for l in layers)
-    sl_price = round(lowest_price * 0.993, 4) 
+    sl_price = round(lowest_price * 0.992, 4) 
 
     return round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), tp_price, sl_price
 
-def process_bot_logic(symbol_pref, mode, risk_pct):
+def process_bot_logic(symbol, mode, risk_pct):
     global active_position, last_trade_time
 
+    candles, ind, df_klines = get_klines_and_indicators(symbol)
+    if not ind or df_klines is None:
+        return
+
     current_time = time.time()
+    current_price = ind["current_price"]
     
-    # ---------------- 1. LIVE CHART & INDICATORS UPDATE ----------------
-    # UI එකට දත්ත යැවීම සඳහා active position නැතත් තෝරාගත් symbol එකේ data නිරන්තරයෙන් ලබා ගනී
-    target_ui_symbol = active_position["symbol"] if active_position else symbol_pref
-    ui_candles, ui_ind, ui_df = get_klines_and_indicators(target_ui_symbol)
+    ml_signal, ml_conf = train_and_predict_ml(df_klines)
 
-    if ui_ind:
-        ui_ml_sig, ui_ml_conf = train_and_predict_ml(target_ui_symbol, ui_df)
-        with state_lock:
-            bot_state["symbol"] = target_ui_symbol
-            bot_state["current_price"] = ui_ind["current_price"]
-            bot_state["candles"] = ui_candles
-            bot_state["ema_20_series"] = ui_ind["ema_20_series"]
-            bot_state["ema_50_series"] = ui_ind["ema_50_series"]
-            bot_state["ema_200_series"] = ui_ind["ema_200_series"]
-            bot_state["current_rsi"] = ui_ind["rsi"]
-            bot_state["current_ema_20"] = ui_ind["ema_20"]
-            bot_state["current_ema_50"] = ui_ind["ema_50"]
-            bot_state["current_ema_200"] = ui_ind["ema_200"]
-            bot_state["current_macd"] = ui_ind["macd"]
-            bot_state["current_macd_signal"] = ui_ind["macd_signal"]
-            bot_state["current_atr"] = ui_ind["atr"]
-            bot_state["ml_signal"] = ui_ml_sig
-            bot_state["ml_confidence"] = ui_ml_conf
+    with state_lock:
+        bot_state["current_price"] = current_price
+        bot_state["candles"] = candles
+        bot_state["ema_20_series"] = ind["ema_20_series"]
+        bot_state["ema_50_series"] = ind["ema_50_series"]
+        bot_state["ema_200_series"] = ind["ema_200_series"]
+        bot_state["current_rsi"] = ind["rsi"]
+        bot_state["current_ema_20"] = ind["ema_20"]
+        bot_state["current_ema_50"] = ind["ema_50"]
+        bot_state["current_ema_200"] = ind["ema_200"]
+        bot_state["current_macd"] = ind["macd"]
+        bot_state["current_macd_signal"] = ind["macd_signal"]
+        bot_state["current_atr"] = ind["atr"]
+        bot_state["ml_signal"] = ml_signal
+        bot_state["ml_confidence"] = ml_conf
 
-    # ---------------- 2. POSITION MANAGEMENT ----------------
+    if not bot_state["is_running"]:
+        return
+
+    atr_val = ind["atr"] if ind["atr"] > 0 else (current_price * 0.005)
+
+    if mode == "real":
+        acc_info = spot_signed_request("/api/v3/account")
+        if isinstance(acc_info, dict) and "balances" in acc_info:
+            usdt_asset = next((a for a in acc_info["balances"] if a["asset"] == "USDT"), None)
+            if usdt_asset:
+                with state_lock:
+                    bot_state["current_balance"] = float(usdt_asset["free"])
+
+    # 1. POSITION MANAGEMENT
     if active_position:
-        sym = active_position["symbol"]
-        candles, ind, df_klines = get_klines_and_indicators(sym)
-        if not ind:
-            return
-
-        current_price = ind["current_price"]
-        atr_val = ind["atr"] if ind["atr"] > 0 else (current_price * 0.005)
-
         layers = active_position["layers"]
         avg_price = active_position["avg_price"]
         total_qty = active_position["total_qty"]
@@ -426,40 +424,31 @@ def process_bot_logic(symbol_pref, mode, risk_pct):
         sl_price = active_position["sl_price"]
         last_layer_price = layers[-1]["price"]
 
-        # Break-Even Guard (+0.45% ගිය විට Entry Price + Fee අගයට SL එක ගෙන ඒම)
-        if current_price >= avg_price * 1.0045:
-            break_even_price = round(avg_price * 1.0018, 4)
-            if break_even_price > active_position["sl_price"]:
-                active_position["sl_price"] = break_even_price
-                active_position["break_even_active"] = True
-                sl_price = break_even_price
-
-        # Trailing TP Guard (+0.60% දී ආරම්භ වේ)
-        if current_price >= avg_price * 1.0060:
-            potential_trailing_sl = round(current_price - (1.0 * atr_val), 4)
-            new_sl = max(sl_price, potential_trailing_sl)
+        if current_price >= avg_price * 1.0080:
+            min_profit_sl = round(avg_price * 1.0050, 4) 
+            potential_trailing_sl = round(current_price - (1.5 * atr_val), 4)
+            new_sl = max(min_profit_sl, potential_trailing_sl)
             if new_sl > sl_price:
                 active_position["sl_price"] = new_sl
                 active_position["trailing_tp_active"] = True
                 sl_price = new_sl
 
-        # Layer 2 Safety
-        layer_step_pct = max(0.007, (1.0 * atr_val) / current_price)
+        layer_step_pct = max(0.008, (1.2 * atr_val) / current_price) 
         can_add_layer = False
-        if len(layers) < 2 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("break_even_active", False):
-            if ind["rsi"] <= 38:
+        if len(layers) < 2 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("trailing_tp_active", False):
+            if ind["rsi"] <= 38: 
                 can_add_layer = True
 
         if can_add_layer:
             with state_lock:
                 balance = bot_state["current_balance"]
-            next_layer_usd = max(6.0, balance * (risk_pct / 100))
+            next_layer_usd = max(6.0, balance * (risk_pct / 100)) 
             next_layer_qty = round(next_layer_usd / current_price, 4)
 
             order_ok = True
             if mode == "real":
                 res = spot_signed_request("/api/v3/order", "POST", {
-                    "symbol": sym, "side": "BUY", "type": "MARKET", "quoteOrderQty": round(next_layer_usd, 2)
+                    "symbol": symbol, "side": "BUY", "type": "MARKET", "quoteOrderQty": round(next_layer_usd, 2)
                 })
                 if "orderId" not in res:
                     order_ok = False
@@ -482,11 +471,8 @@ def process_bot_logic(symbol_pref, mode, risk_pct):
                 active_position["tp_price"] = tp_price
                 active_position["sl_price"] = sl_price
 
-        status_tag = " (Break-Even 🛡️)" if active_position.get("break_even_active", False) else ""
-        if active_position.get("trailing_tp_active", False):
-            status_tag = " (Trailing 🔥)"
-
-        status_msg = f"{sym} SPOT ({len(layers)}/2L){status_tag} | Avg: ${avg_price} | TP: ${tp_price} | SL: ${sl_price}"
+        status_trail = " (Trailing Active 🔥)" if active_position.get("trailing_tp_active", False) else ""
+        status_msg = f"SPOT DCA (LONG {len(layers)}/2 Layers){status_trail} | Avg: ${avg_price} | TP: ${tp_price} | SL: ${sl_price}"
         with state_lock:
             bot_state["status_message"] = status_msg
 
@@ -502,108 +488,98 @@ def process_bot_logic(symbol_pref, mode, risk_pct):
 
         if trade_closed:
             notional_val = total_qty * avg_price
-            est_fee = (notional_val * 2) * 0.0010
+            est_fee = (notional_val * 2) * 0.0010 
             net_pnl = round(gross_pnl - est_fee, 2)
-
-            outcome = f"ජයග්‍රහණය (+{net_pnl}$ 🔥)" if net_pnl >= 0 else f"පරාජය (SL {net_pnl}$)"
+            outcome = f"ජයග්‍රහණය (Pro Trailing Hit 🔥 - {len(layers)} Layers)" if net_pnl >= 0 else "පරාජය (Emergency SL Hit)"
 
             if mode == "real":
                 spot_signed_request("/api/v3/order", "POST", {
-                    "symbol": sym, "side": "SELL", "type": "MARKET", "quantity": round(total_qty, 4)
+                    "symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": round(total_qty, 4)
                 })
 
-            save_trade_to_db(active_position["entry_time"], sym, "SPOT LONG", avg_price, len(layers), tp_price, sl_price, active_position["rsi"], active_position["macd"], active_position["ml_conf"], net_pnl, outcome)
+            save_trade_to_db(active_position["entry_time"], symbol, "SPOT LONG", avg_price, len(layers), tp_price, sl_price, active_position["rsi"], active_position["macd"], active_position["ml_conf"], net_pnl, outcome)
             active_position = None
             last_trade_time = current_time
 
-    # ---------------- 3. MULTI-PAIR ENTRY SCANNER ----------------
+    # 2. ENTRY SCANNER
     else:
-        cooldown_period = 6
+        cooldown_period = 10  
         if (current_time - last_trade_time) < cooldown_period:
-            rem = int(cooldown_period - (current_time - last_trade_time))
+            rem_sec = int(cooldown_period - (current_time - last_trade_time))
             with state_lock:
-                bot_state["status_message"] = f"විරාමය (Cooldown): තව තත්පර {rem}..."
+                bot_state["status_message"] = f"විරාමය (Cooldown): තව තත්පර {rem_sec}..."
             return
 
-        pairs_to_scan = SCAN_PAIRS if symbol_pref == "ETHUSDT" else [symbol_pref]
-        downtrend_detected = False
+        # >>> STRICT DOWNTREND GUARD: මිල EMA 200 ට වඩා අඩු නම් Trade open නොකර මුදල් රැක ගනී <<<
+        if current_price <= ind["ema_200"]:
+            with state_lock:
+                bot_state["status_message"] = f"🛡️ Downtrend ආරක්ෂාව ක්‍රියාත්මකයි: මිල (${current_price}) EMA 200 (${ind['ema_200']}) ට අඩු බැවින් Trade අවහිර කර ඇත."
+            return
 
-        for test_symbol in pairs_to_scan:
-            candles, ind, df_klines = get_klines_and_indicators(test_symbol)
-            if not ind or df_klines is None:
-                continue
-
-            current_price = ind["current_price"]
-            ml_signal, ml_conf = train_and_predict_ml(test_symbol, df_klines)
-            macd_diff = ind["macd"] - ind["macd_signal"]
-
-            # TREND GUARD: Price must be above EMA 200 (Uptrend)
-            if current_price > ind["ema_200"]:
-                if ((ind["ema_20"] > ind["ema_50"] or macd_diff > 0) and (30 <= ind["rsi"] <= 72)):
-                    if ml_signal == "LONG" and ml_conf >= 50.0:
-                        
-                        with state_lock:
-                            bot_state["status_message"] = f"Groq AI මගින් {test_symbol} Scalp අවස්ථාව තහවුරු කරමින්..."
-
-                        ai_approved, ai_reason = analyze_trade_with_groq_ai(test_symbol, current_price, ind["rsi"], ind["macd"], ml_conf)
-                        
-                        with state_lock:
-                            bot_state["ai_decision"] = "CONFIRMED" if ai_approved else "REJECTED"
-                            bot_state["ai_reasoning"] = ai_reason
-
-                        if ai_approved:
-                            with state_lock:
-                                balance = bot_state["current_balance"]
-
-                            base_layer_usd = max(6.0, balance * (risk_pct / 100))
-                            base_qty = round(base_layer_usd / current_price, 4)
-
-                            if base_qty > 0 and balance >= 6:
-                                order_ok = True
-                                if mode == "real":
-                                    res = spot_signed_request("/api/v3/order", "POST", {
-                                        "symbol": test_symbol, "side": "BUY", "type": "MARKET", "quoteOrderQty": round(base_layer_usd, 2)
-                                    })
-                                    if "orderId" not in res:
-                                        order_ok = False
-
-                                if order_ok:
-                                    entry_time_str = time.strftime('%H:%M:%S', time.localtime())
-                                    initial_layers = [{
-                                        "layer": 1,
-                                        "price": current_price,
-                                        "qty": base_qty,
-                                        "cost": round(base_layer_usd, 2),
-                                        "time": entry_time_str
-                                    }]
-                                    avg_price, total_qty, total_cost, tp_price, sl_price = recalculate_spot_dca_levels(initial_layers)
-
-                                    active_position = {
-                                        "symbol": test_symbol,
-                                        "side": "SPOT LONG",
-                                        "layers": initial_layers,
-                                        "avg_price": avg_price,
-                                        "total_qty": total_qty,
-                                        "total_cost": total_cost,
-                                        "tp_price": tp_price,
-                                        "sl_price": sl_price,
-                                        "entry_time": entry_time_str,
-                                        "rsi": ind["rsi"], "macd": ind["macd"], "ml_conf": ml_conf,
-                                        "trailing_tp_active": False,
-                                        "break_even_active": False
-                                    }
-                                    with state_lock:
-                                        bot_state["status_message"] = f"Scalp Layer 1 ({test_symbol}) ඇතුළත් විය!"
-                                    return
-            else:
-                downtrend_detected = True
-
-        # කිසිදු Trade එකක් Open නොවූයේ නම් පරිශීලකයාට පැහැදිලි Status එකක් පෙන්වයි
         with state_lock:
-            if downtrend_detected and not active_position:
-                bot_state["status_message"] = f"🛡️ Downtrend ආරක්ෂාව ක්‍රියාත්මකයි (මිල < EMA 200). පාඩු වැළැක්වීමට මුදල් ආරක්ෂා කරමින් Uptrend එකක් බලාපොරොත්තුවෙන් සිටී..."
-            else:
-                bot_state["status_message"] = "Multi-Pair Ultra Scalp Scanner (ETH/SOL/BTC) Uptrend අවස්ථා නිරීක්ෂණය කරමින් පවතී..."
+            bot_state["status_message"] = f"Pro Base Entry Signal නිරීක්ෂණය වේ (Uptrend තහවුරුයි)..."
+        
+        tech_signal = None
+        macd_diff = ind["macd"] - ind["macd_signal"]
+
+        if ((ind["ema_20"] > ind["ema_50"] or macd_diff > 0) and (30 <= ind["rsi"] <= 72)):
+            tech_signal = "LONG"
+
+        if tech_signal and tech_signal == ml_signal and ml_conf >= 50.0:
+            with state_lock:
+                bot_state["status_message"] = "Groq AI හරහා Pro Base Entry එක තහවුරු කරමින්..."
+            
+            ai_approved, ai_reason = analyze_trade_with_groq_ai(
+                tech_signal, current_price, ind["rsi"], 
+                ind["macd"], ind["ema_20"], ind["ema_200"], ml_conf, 0.0
+            )
+
+            with state_lock:
+                bot_state["ai_decision"] = "CONFIRMED" if ai_approved else "REJECTED"
+                bot_state["ai_reasoning"] = ai_reason
+
+            if ai_approved:
+                with state_lock:
+                    balance = bot_state["current_balance"]
+                
+                base_layer_usd = max(6.0, balance * (risk_pct / 100)) 
+                base_qty = round(base_layer_usd / current_price, 4)
+
+                if base_qty > 0 and balance >= 6:
+                    order_success = True
+                    if mode == "real":
+                        res = spot_signed_request("/api/v3/order", "POST", {
+                            "symbol": symbol, "side": "BUY", "type": "MARKET", "quoteOrderQty": round(base_layer_usd, 2)
+                        })
+                        if "orderId" not in res:
+                            order_success = False
+
+                    if order_success:
+                        entry_time_str = time.strftime('%H:%M:%S', time.localtime())
+                        initial_layers = [{
+                            "layer": 1,
+                            "price": current_price,
+                            "qty": base_qty,
+                            "cost": round(base_layer_usd, 2),
+                            "time": entry_time_str
+                        }]
+                        avg_price, total_qty, total_cost, tp_price, sl_price = recalculate_spot_dca_levels(initial_layers)
+
+                        active_position = {
+                            "side": "SPOT LONG",
+                            "layers": initial_layers,
+                            "avg_price": avg_price,
+                            "total_qty": total_qty,
+                            "total_cost": total_cost,
+                            "tp_price": tp_price,
+                            "sl_price": sl_price,
+                            "entry_time": entry_time_str,
+                            "rsi": ind["rsi"], "macd": ind["macd"], "ml_conf": ml_conf,
+                            "trailing_tp_active": False
+                        }
+
+                        with state_lock:
+                            bot_state["status_message"] = "Binance Spot Base Layer 1 (ETH) ඇතුළත් විය!"
 
 def bot_worker():
     while True:
@@ -612,14 +588,12 @@ def bot_worker():
                 symbol = bot_state["symbol"]
                 mode = bot_state["mode"]
                 risk_pct = bot_state["risk_pct"]
-                is_running = bot_state["is_running"]
             
-            if is_running:
-                process_bot_logic(symbol, mode, risk_pct)
+            process_bot_logic(symbol, mode, risk_pct)
         except Exception as e:
             print(f"Bot cycle exception: {e}")
             
-        time.sleep(2)
+        time.sleep(3)
 
 def start_worker_safely():
     global worker_thread_started
@@ -673,6 +647,7 @@ def start_bot():
         bot_state["api_secret"] = data.get("api_secret", "")
         bot_state["mode"] = data.get("mode", "paper")
         bot_state["symbol"] = data.get("symbol", "ETHUSDT")
+        bot_state["leverage"] = 1 
         bot_state["risk_pct"] = float(data.get("risk_pct", 15.0))
         
         if bot_state["mode"] == "paper":
@@ -681,9 +656,9 @@ def start_bot():
             bot_state["current_balance"] = init_bal
             
         bot_state["is_running"] = True
-        bot_state["status_message"] = f"Ultra Scalp Multi-Pair Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
+        bot_state["status_message"] = f"Binance Spot Pro Engine ({bot_state['mode'].upper()} Mode) ආරම්භ විය!"
         
-    return jsonify({"status": "success", "message": "Ultra Scalp Bot සාර්ථකව ආරම්භ විය!"})
+    return jsonify({"status": "success", "message": "Bot සාර්ථකව ආරම්භ විය!"})
 
 @app.route("/api/reset_demo", methods=["POST"])
 def reset_demo():
@@ -695,7 +670,7 @@ def reset_demo():
         cursor.execute("DELETE FROM trade_history")
         conn.commit()
         conn.close()
-    except Exception:
+    except Exception as e:
         pass
 
     with state_lock:
@@ -707,9 +682,11 @@ def reset_demo():
         bot_state["accuracy"] = 0.0
         bot_state["current_profit"] = 0.0
         bot_state["active_trades"] = []
+        bot_state["db_total_trades"] = 0
+        bot_state["db_win_rate"] = 0.0
         bot_state["status_message"] = f"Demo Balance එක ${init_bal} ට Reset විය."
 
-    return jsonify({"status": "success", "message": "Reset සාර්ථකයි!"})
+    return jsonify({"status": "success", "message": "Demo Balance එක Reset විය!"})
 
 @app.route("/api/stop", methods=["POST"])
 def stop_bot():
@@ -722,13 +699,23 @@ def stop_bot():
 def get_status():
     start_worker_safely()
     with state_lock:
+        symbol = bot_state["symbol"]
+        mode = bot_state["mode"]
+        risk_pct = bot_state["risk_pct"]
+
+    try:
+        process_bot_logic(symbol, mode, risk_pct)
+    except Exception:
+        pass
+
+    with state_lock:
         active_pos_data = None
         available_free_balance = bot_state["current_balance"]
 
         if active_position:
             unrealized_pnl = round((bot_state["current_price"] - active_position["avg_price"]) * active_position["total_qty"], 2)
             active_pos_data = {
-                "side": f"{active_position['symbol']} {active_position['side']}",
+                "side": active_position["side"],
                 "layers": active_position["layers"],
                 "layers_count": len(active_position["layers"]),
                 "avg_price": active_position["avg_price"],
