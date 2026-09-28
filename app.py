@@ -10,8 +10,12 @@ import sqlite3
 import pandas as pd
 import numpy as np
 import requests
+import urllib3
 from flask import Flask, jsonify, request
 from sklearn.ensemble import RandomForestClassifier
+
+# Windows SSL warnings disable කිරීම
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
@@ -37,7 +41,7 @@ bot_state = {
     "current_balance": 1000.0,
     
     "current_price": 0.0,
-    "status_message": "Pro High Profit Spot DCA Engine සජීවීව ක්‍රියාත්මක වේ...",
+    "status_message": "Bot සම්බන්ධ වෙමින් පවතී (Connecting to Binance)...",
     "wins": 0,
     "losses": 0,
     "total_trades": 0,
@@ -60,7 +64,7 @@ bot_state = {
     "ml_signal": "NEUTRAL",
     "ml_confidence": 0.0,
     "ai_decision": "WAITING",
-    "ai_reasoning": "Pro High Profit Engine සූදානම්ව පවතී...",
+    "ai_reasoning": "Engine සූදානම්...",
     "db_total_trades": 0,
     "db_win_rate": 0.0,
     "auto_tuned_ml_filter": 50.0
@@ -70,6 +74,18 @@ active_position = None
 last_trade_time = 0
 state_lock = threading.Lock()
 worker_thread_started = False
+
+def clean_coin_symbol(sym):
+    if not sym:
+        return "ETHUSDT"
+    s = str(sym).upper().replace("/", "").replace(" ", "").replace("-", "")
+    if "ETH" in s:
+        return "ETHUSDT"
+    elif "SOL" in s:
+        return "SOLUSDT"
+    elif "BTC" in s:
+        return "BTCUSDT"
+    return "ETHUSDT"
 
 def init_db():
     try:
@@ -165,11 +181,14 @@ PUBLIC_BINANCE_URLS = [
 ]
 
 def spot_public_request(endpoint, params=None):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
     for base_url in PUBLIC_BINANCE_URLS:
         try:
             url = f"{base_url}{endpoint}"
-            res = requests.get(url, params=params, headers=headers, timeout=4.0)
+            res = requests.get(url, params=params, headers=headers, timeout=4.0, verify=False)
             if res.status_code == 200:
                 data = res.json()
                 if isinstance(data, list) and len(data) > 0:
@@ -189,22 +208,21 @@ def spot_signed_request(endpoint, method="GET", params=None):
         api_secret = bot_state["api_secret"]
     
     if not api_key or not api_secret:
-        return {"error": "API Key/Secret Missing"}
+        return {"error": "API Key Missing"}
         
     params["timestamp"] = int(time.time() * 1000)
     query_string = urllib.parse.urlencode(params)
     signature = hmac.new(api_secret.encode('utf-8'), query_string.encode('utf-8'), hashlib.sha256).hexdigest()
     params["signature"] = signature
-    
     headers = {"X-MBX-APIKEY": api_key, "User-Agent": "Mozilla/5.0"}
     
     for base_url in ["https://api.binance.com", "https://api1.binance.com", "https://api2.binance.com"]:
         try:
             url = f"{base_url}{endpoint}"
             if method == "GET":
-                res = requests.get(url, params=params, headers=headers, timeout=4.0)
+                res = requests.get(url, params=params, headers=headers, timeout=4.0, verify=False)
             elif method == "POST":
-                res = requests.post(url, data=params, headers=headers, timeout=4.0)
+                res = requests.post(url, data=params, headers=headers, timeout=4.0, verify=False)
             if res.status_code == 200:
                 return res.json()
         except Exception:
@@ -216,7 +234,7 @@ def analyze_trade_with_groq_ai(signal, price, rsi, macd, ema20, ema200, ml_conf,
     current_time = time.time()
     
     if (current_time - last_groq_call_time) < GROQ_COOLDOWN_SECONDS:
-        return True, "Groq Limit Protection: Approved."
+        return True, "Groq Cooldown Pass."
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -237,7 +255,7 @@ def analyze_trade_with_groq_ai(signal, price, rsi, macd, ema20, ema200, ml_conf,
 
     try:
         last_groq_call_time = time.time()
-        res = requests.post(GROQ_URL, json=payload, headers=headers, timeout=4.0)
+        res = requests.post(GROQ_URL, json=payload, headers=headers, timeout=4.0, verify=False)
         if res.status_code == 200:
             result = res.json()
             content = result['choices'][0]['message']['content']
@@ -286,8 +304,10 @@ def train_and_predict_ml(df):
         return "NEUTRAL", 50.0
 
 def get_klines_and_indicators(symbol):
-    params = {"symbol": symbol, "interval": "3m", "limit": 250}
+    sym = clean_coin_symbol(symbol)
+    params = {"symbol": sym, "interval": "3m", "limit": 250}
     data = spot_public_request("/api/v3/klines", params)
+    
     if not data or len(data) < 200:
         return None, None, None
     
@@ -377,16 +397,22 @@ def recalculate_spot_dca_levels(layers):
 def process_bot_logic(symbol, mode, risk_pct):
     global active_position, last_trade_time
 
-    candles, ind, df_klines = get_klines_and_indicators(symbol)
+    sym = clean_coin_symbol(symbol)
+    candles, ind, df_klines = get_klines_and_indicators(sym)
+    
     if not ind or df_klines is None:
+        print(f"[BINANCE WAITING] Could not get data for {sym}. Retrying...")
         return
 
     current_time = time.time()
     current_price = ind["current_price"]
     
+    print(f"[BINANCE DATA OK] {sym} Price: ${current_price} | RSI: {ind['rsi']} | EMA200: {ind['ema_200']}")
+
     ml_signal, ml_conf = train_and_predict_ml(df_klines)
 
     with state_lock:
+        bot_state["symbol"] = sym
         bot_state["current_price"] = current_price
         bot_state["candles"] = candles
         bot_state["ema_20_series"] = ind["ema_20_series"]
@@ -448,7 +474,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             order_ok = True
             if mode == "real":
                 res = spot_signed_request("/api/v3/order", "POST", {
-                    "symbol": symbol, "side": "BUY", "type": "MARKET", "quoteOrderQty": round(next_layer_usd, 2)
+                    "symbol": sym, "side": "BUY", "type": "MARKET", "quoteOrderQty": round(next_layer_usd, 2)
                 })
                 if "orderId" not in res:
                     order_ok = False
@@ -490,20 +516,20 @@ def process_bot_logic(symbol, mode, risk_pct):
             notional_val = total_qty * avg_price
             est_fee = (notional_val * 2) * 0.0010 
             net_pnl = round(gross_pnl - est_fee, 2)
-            outcome = f"ජයග්‍රහණය (Pro Trailing Hit 🔥 - {len(layers)} Layers)" if net_pnl >= 0 else "පරාජය (Emergency SL Hit)"
+            outcome = f"ජයග්‍රහණය (+{net_pnl}$ 🔥)" if net_pnl >= 0 else "පරාජය (Emergency SL Hit)"
 
             if mode == "real":
                 spot_signed_request("/api/v3/order", "POST", {
-                    "symbol": symbol, "side": "SELL", "type": "MARKET", "quantity": round(total_qty, 4)
+                    "symbol": sym, "side": "SELL", "type": "MARKET", "quantity": round(total_qty, 4)
                 })
 
-            save_trade_to_db(active_position["entry_time"], symbol, "SPOT LONG", avg_price, len(layers), tp_price, sl_price, active_position["rsi"], active_position["macd"], active_position["ml_conf"], net_pnl, outcome)
+            save_trade_to_db(active_position["entry_time"], sym, "SPOT LONG", avg_price, len(layers), tp_price, sl_price, active_position["rsi"], active_position["macd"], active_position["ml_conf"], net_pnl, outcome)
             active_position = None
             last_trade_time = current_time
 
-    # 2. ENTRY SCANNER
+    # 2. ENTRY SIGNAL HUNTING
     else:
-        cooldown_period = 10  
+        cooldown_period = 6  
         if (current_time - last_trade_time) < cooldown_period:
             rem_sec = int(cooldown_period - (current_time - last_trade_time))
             with state_lock:
@@ -513,7 +539,7 @@ def process_bot_logic(symbol, mode, risk_pct):
         # >>> STRICT DOWNTREND GUARD: මිල EMA 200 ට වඩා අඩු නම් Trade open නොකර මුදල් රැක ගනී <<<
         if current_price <= ind["ema_200"]:
             with state_lock:
-                bot_state["status_message"] = f"🛡️ Downtrend ආරක්ෂාව ක්‍රියාත්මකයි: මිල (${current_price}) EMA 200 (${ind['ema_200']}) ට අඩු බැවින් Trade අවහිර කර ඇත."
+                bot_state["status_message"] = f"🛡️ Downtrend ආරක්ෂාව: මිල (${current_price}) EMA 200 (${ind['ema_200']}) ට අඩු බැවින් Trade අවහිර කර ඇත (Waiting for Uptrend)..."
             return
 
         with state_lock:
@@ -549,7 +575,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                     order_success = True
                     if mode == "real":
                         res = spot_signed_request("/api/v3/order", "POST", {
-                            "symbol": symbol, "side": "BUY", "type": "MARKET", "quoteOrderQty": round(base_layer_usd, 2)
+                            "symbol": sym, "side": "BUY", "type": "MARKET", "quoteOrderQty": round(base_layer_usd, 2)
                         })
                         if "orderId" not in res:
                             order_success = False
@@ -579,7 +605,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                         }
 
                         with state_lock:
-                            bot_state["status_message"] = "Binance Spot Base Layer 1 (ETH) ඇතුළත් විය!"
+                            bot_state["status_message"] = f"Binance Spot Base Layer 1 ({sym}) ඇතුළත් විය!"
 
 def bot_worker():
     while True:
@@ -617,7 +643,7 @@ def index():
 @app.route("/api/ip")
 def get_server_ip():
     try:
-        res = requests.get("https://api.ipify.org?format=json", timeout=3)
+        res = requests.get("https://api.ipify.org?format=json", timeout=3, verify=False)
         if res.status_code == 200:
             return jsonify(res.json())
         return jsonify({"ip": "Unavailable"})
@@ -646,7 +672,7 @@ def start_bot():
         bot_state["api_token"] = data.get("api_token", "")
         bot_state["api_secret"] = data.get("api_secret", "")
         bot_state["mode"] = data.get("mode", "paper")
-        bot_state["symbol"] = data.get("symbol", "ETHUSDT")
+        bot_state["symbol"] = clean_coin_symbol(data.get("symbol", "ETHUSDT"))
         bot_state["leverage"] = 1 
         bot_state["risk_pct"] = float(data.get("risk_pct", 15.0))
         
@@ -670,7 +696,7 @@ def reset_demo():
         cursor.execute("DELETE FROM trade_history")
         conn.commit()
         conn.close()
-    except Exception as e:
+    except Exception:
         pass
 
     with state_lock:
@@ -682,8 +708,6 @@ def reset_demo():
         bot_state["accuracy"] = 0.0
         bot_state["current_profit"] = 0.0
         bot_state["active_trades"] = []
-        bot_state["db_total_trades"] = 0
-        bot_state["db_win_rate"] = 0.0
         bot_state["status_message"] = f"Demo Balance එක ${init_bal} ට Reset විය."
 
     return jsonify({"status": "success", "message": "Demo Balance එක Reset විය!"})
