@@ -21,11 +21,11 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 last_groq_call_time = 0
-GROQ_COOLDOWN_SECONDS = 40  
+GROQ_COOLDOWN_SECONDS = 30  
 
 DB_FILE = "bot_memory.db"
 
-# Multi-Pair Watchlist (Trade එකක් නැති විට මෙම තුනම scan කර Uptrend එක තෝරා ගනී)
+# Multi-Pair Watchlist
 SCAN_PAIRS = ["ETHUSDT", "SOLUSDT", "BTCUSDT"]
 
 bot_state = {
@@ -40,7 +40,7 @@ bot_state = {
     "current_balance": 1000.0,
     
     "current_price": 0.0,
-    "status_message": "Pro Ultra Scalp Engine සූදානම්ව පවතී...",
+    "status_message": "Ultra Scalp Live Engine ආරම්භ වෙමින් පවතී...",
     "wins": 0,
     "losses": 0,
     "total_trades": 0,
@@ -73,8 +73,6 @@ active_position = None
 last_trade_time = 0
 state_lock = threading.Lock()
 worker_thread_started = False
-
-# ML Model Cache (සෑම තත්පර 2ටම Retrain වීම වළක්වා Speed වැඩි කරයි)
 ml_models_cache = {}
 
 def init_db():
@@ -162,38 +160,21 @@ def save_trade_to_db(timestamp, symbol, side, avg_price, layers_count, tp, sl, r
     except Exception as e:
         print(f"[DATABASE ERROR] Could not save trade: {e}")
 
-def get_db_stats_and_dynamic_filter():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*), SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) FROM trade_history")
-        total_count, total_wins = cursor.fetchone()
-        conn.close()
-
-        total_trades = total_count if total_count else 0
-        historical_win_rate = round((total_wins / total_trades * 100), 1) if total_trades > 0 else 0.0
-        return total_trades, historical_win_rate, 50.0
-    except Exception:
-        return 0, 0.0, 50.0
-
 PUBLIC_BINANCE_URLS = [
-    "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
-    "https://api3.binance.com"
+    "https://data-api.binance.vision"
 ]
 
 def spot_public_request(endpoint, params=None):
     for base_url in PUBLIC_BINANCE_URLS:
         try:
             url = f"{base_url}{endpoint}"
-            res = requests.get(url, params=params, timeout=2.5)
+            res = requests.get(url, params=params, timeout=3.0)
             if res.status_code == 200:
                 data = res.json()
-                if isinstance(data, list) and len(data) > 0:
-                    return data
-                elif isinstance(data, dict) and "code" not in data:
+                if isinstance(data, (list, dict)):
                     return data
         except Exception:
             continue
@@ -221,9 +202,9 @@ def spot_signed_request(endpoint, method="GET", params=None):
         try:
             url = f"{base_url}{endpoint}"
             if method == "GET":
-                res = requests.get(url, params=params, headers=headers, timeout=2.5)
+                res = requests.get(url, params=params, headers=headers, timeout=3.0)
             elif method == "POST":
-                res = requests.post(url, data=params, headers=headers, timeout=2.5)
+                res = requests.post(url, data=params, headers=headers, timeout=3.0)
             if res.status_code == 200:
                 return res.json()
         except Exception:
@@ -235,7 +216,7 @@ def analyze_trade_with_groq_ai(symbol, price, rsi, macd, ml_conf):
     current_time = time.time()
     
     if (current_time - last_groq_call_time) < GROQ_COOLDOWN_SECONDS:
-        return True, "Groq Fast Pass: Scalp signal verified."
+        return True, "Groq Fast Pass: Scalp signal approved."
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -243,8 +224,8 @@ def analyze_trade_with_groq_ai(symbol, price, rsi, macd, ml_conf):
     }
 
     prompt = f"""
-    Scalp Decision for {symbol}: Price={price}, RSI={rsi}, MACD={macd}, ML Conf={ml_conf}%.
-    Strict JSON only: {{"decision": "CONFIRM" or "REJECT", "reason": "Short reason"}}
+    Validate Scalp Entry: Symbol={symbol}, Price={price}, RSI={rsi}, MACD={macd}, ML Conf={ml_conf}%.
+    Respond in JSON only: {{"decision": "CONFIRM" or "REJECT", "reason": "Short summary"}}
     """
 
     payload = {
@@ -284,7 +265,6 @@ def train_and_predict_ml(symbol, df):
         current_time = time.time()
         model_info = ml_models_cache.get(symbol)
         
-        # Retrain only once every 30 minutes to boost bot speed
         if not model_info or (current_time - model_info["time"] > 1800):
             X = clean_df[features][:-1]
             y = clean_df['target'][:-1]
@@ -296,12 +276,17 @@ def train_and_predict_ml(symbol, df):
 
         latest_features = clean_df[features].iloc[-1:].values
         probs = model.predict_proba(latest_features)[0]
-        prob_up = probs[1] * 100
+        
+        if len(model.classes_) > 1 and 1 in model.classes_:
+            idx = list(model.classes_).index(1)
+            prob_up = round(probs[idx] * 100, 1)
+        else:
+            prob_up = 50.0
         
         if prob_up >= 50.0:
-            return "LONG", round(prob_up, 1)
+            return "LONG", prob_up
         else:
-            return "NEUTRAL", round(prob_up, 1)
+            return "NEUTRAL", prob_up
 
     except Exception:
         return "NEUTRAL", 50.0
@@ -389,7 +374,6 @@ def recalculate_spot_dca_levels(layers):
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
-    # Quick Scalp TP: +0.95% above avg entry (Rapid Take-Profit)
     tp_price = round(avg_price * 1.0095, 4)
     lowest_price = min(l["price"] for l in layers)
     sl_price = round(lowest_price * 0.993, 4) 
@@ -400,8 +384,32 @@ def process_bot_logic(symbol_pref, mode, risk_pct):
     global active_position, last_trade_time
 
     current_time = time.time()
+    
+    # ---------------- 1. LIVE CHART & INDICATORS UPDATE ----------------
+    # UI එකට දත්ත යැවීම සඳහා active position නැතත් තෝරාගත් symbol එකේ data නිරන්තරයෙන් ලබා ගනී
+    target_ui_symbol = active_position["symbol"] if active_position else symbol_pref
+    ui_candles, ui_ind, ui_df = get_klines_and_indicators(target_ui_symbol)
 
-    # 1. කළමනාකරණය: Active Position එකක් ඇත්නම් එය පමණක් Track කරන්න
+    if ui_ind:
+        ui_ml_sig, ui_ml_conf = train_and_predict_ml(target_ui_symbol, ui_df)
+        with state_lock:
+            bot_state["symbol"] = target_ui_symbol
+            bot_state["current_price"] = ui_ind["current_price"]
+            bot_state["candles"] = ui_candles
+            bot_state["ema_20_series"] = ui_ind["ema_20_series"]
+            bot_state["ema_50_series"] = ui_ind["ema_50_series"]
+            bot_state["ema_200_series"] = ui_ind["ema_200_series"]
+            bot_state["current_rsi"] = ui_ind["rsi"]
+            bot_state["current_ema_20"] = ui_ind["ema_20"]
+            bot_state["current_ema_50"] = ui_ind["ema_50"]
+            bot_state["current_ema_200"] = ui_ind["ema_200"]
+            bot_state["current_macd"] = ui_ind["macd"]
+            bot_state["current_macd_signal"] = ui_ind["macd_signal"]
+            bot_state["current_atr"] = ui_ind["atr"]
+            bot_state["ml_signal"] = ui_ml_sig
+            bot_state["ml_confidence"] = ui_ml_conf
+
+    # ---------------- 2. POSITION MANAGEMENT ----------------
     if active_position:
         sym = active_position["symbol"]
         candles, ind, df_klines = get_klines_and_indicators(sym)
@@ -411,21 +419,6 @@ def process_bot_logic(symbol_pref, mode, risk_pct):
         current_price = ind["current_price"]
         atr_val = ind["atr"] if ind["atr"] > 0 else (current_price * 0.005)
 
-        with state_lock:
-            bot_state["current_price"] = current_price
-            bot_state["symbol"] = sym
-            bot_state["candles"] = candles
-            bot_state["ema_20_series"] = ind["ema_20_series"]
-            bot_state["ema_50_series"] = ind["ema_50_series"]
-            bot_state["ema_200_series"] = ind["ema_200_series"]
-            bot_state["current_rsi"] = ind["rsi"]
-            bot_state["current_ema_20"] = ind["ema_20"]
-            bot_state["current_ema_50"] = ind["ema_50"]
-            bot_state["current_ema_200"] = ind["ema_200"]
-            bot_state["current_macd"] = ind["macd"]
-            bot_state["current_macd_signal"] = ind["macd_signal"]
-            bot_state["current_atr"] = ind["atr"]
-
         layers = active_position["layers"]
         avg_price = active_position["avg_price"]
         total_qty = active_position["total_qty"]
@@ -433,15 +426,15 @@ def process_bot_logic(symbol_pref, mode, risk_pct):
         sl_price = active_position["sl_price"]
         last_layer_price = layers[-1]["price"]
 
-        # UPGRADE: BREAK-EVEN GUARD (මිල +0.45% ගිය විට Stop Loss එක Entry+Fee අගයට ගෙනැවිත් Loss එක 0 කරයි)
+        # Break-Even Guard (+0.45% ගිය විට Entry Price + Fee අගයට SL එක ගෙන ඒම)
         if current_price >= avg_price * 1.0045:
-            break_even_price = round(avg_price * 1.0018, 4) # Covers Binance 0.15% fee + micro gain
+            break_even_price = round(avg_price * 1.0018, 4)
             if break_even_price > active_position["sl_price"]:
                 active_position["sl_price"] = break_even_price
                 active_position["break_even_active"] = True
                 sl_price = break_even_price
 
-        # UPGRADE: TIGHT SCALP TRAILING GUARD (+0.60% දී Trailing ආරම්භ වේ)
+        # Trailing TP Guard (+0.60% දී ආරම්භ වේ)
         if current_price >= avg_price * 1.0060:
             potential_trailing_sl = round(current_price - (1.0 * atr_val), 4)
             new_sl = max(sl_price, potential_trailing_sl)
@@ -450,7 +443,7 @@ def process_bot_logic(symbol_pref, mode, risk_pct):
                 active_position["trailing_tp_active"] = True
                 sl_price = new_sl
 
-        # Safety Layer Distance
+        # Layer 2 Safety
         layer_step_pct = max(0.007, (1.0 * atr_val) / current_price)
         can_add_layer = False
         if len(layers) < 2 and current_price <= last_layer_price * (1 - layer_step_pct) and not active_position.get("break_even_active", False):
@@ -512,10 +505,7 @@ def process_bot_logic(symbol_pref, mode, risk_pct):
             est_fee = (notional_val * 2) * 0.0010
             net_pnl = round(gross_pnl - est_fee, 2)
 
-            if net_pnl >= 0:
-                outcome = f"ජයග්‍රහණය (Scalp Profit +{net_pnl}$ 🔥)"
-            else:
-                outcome = f"පරාජය (SL Hit {net_pnl}$)"
+            outcome = f"ජයග්‍රහණය (+{net_pnl}$ 🔥)" if net_pnl >= 0 else f"පරාජය (SL {net_pnl}$)"
 
             if mode == "real":
                 spot_signed_request("/api/v3/order", "POST", {
@@ -526,7 +516,7 @@ def process_bot_logic(symbol_pref, mode, risk_pct):
             active_position = None
             last_trade_time = current_time
 
-    # 2. POSITION නැති විට: MULTI-PAIR SCANNER එක Uptrend Pairs සොයයි
+    # ---------------- 3. MULTI-PAIR ENTRY SCANNER ----------------
     else:
         cooldown_period = 6
         if (current_time - last_trade_time) < cooldown_period:
@@ -535,10 +525,8 @@ def process_bot_logic(symbol_pref, mode, risk_pct):
                 bot_state["status_message"] = f"විරාමය (Cooldown): තව තත්පර {rem}..."
             return
 
-        with state_lock:
-            bot_state["status_message"] = "Multi-Pair Ultra Scalp Scanner (ETH/SOL/BTC) නිරීක්ෂණය වේ..."
-
         pairs_to_scan = SCAN_PAIRS if symbol_pref == "ETHUSDT" else [symbol_pref]
+        downtrend_detected = False
 
         for test_symbol in pairs_to_scan:
             candles, ind, df_klines = get_klines_and_indicators(test_symbol)
@@ -549,19 +537,13 @@ def process_bot_logic(symbol_pref, mode, risk_pct):
             ml_signal, ml_conf = train_and_predict_ml(test_symbol, df_klines)
             macd_diff = ind["macd"] - ind["macd_signal"]
 
-            # >>> STRICT DOWNTREND GUARD: මිල EMA 200 ට ඉහළින් ඇති Uptrend පමණක් තෝරා ගනී <<<
+            # TREND GUARD: Price must be above EMA 200 (Uptrend)
             if current_price > ind["ema_200"]:
                 if ((ind["ema_20"] > ind["ema_50"] or macd_diff > 0) and (30 <= ind["rsi"] <= 72)):
                     if ml_signal == "LONG" and ml_conf >= 50.0:
                         
                         with state_lock:
-                            bot_state["symbol"] = test_symbol
-                            bot_state["current_price"] = current_price
-                            bot_state["current_rsi"] = ind["rsi"]
-                            bot_state["current_macd"] = ind["macd"]
-                            bot_state["ml_signal"] = ml_signal
-                            bot_state["ml_confidence"] = ml_conf
-                            bot_state["status_message"] = f"Groq AI මගින් {test_symbol} තහවුරු කරමින්..."
+                            bot_state["status_message"] = f"Groq AI මගින් {test_symbol} Scalp අවස්ථාව තහවුරු කරමින්..."
 
                         ai_approved, ai_reason = analyze_trade_with_groq_ai(test_symbol, current_price, ind["rsi"], ind["macd"], ml_conf)
                         
@@ -612,7 +594,16 @@ def process_bot_logic(symbol_pref, mode, risk_pct):
                                     }
                                     with state_lock:
                                         bot_state["status_message"] = f"Scalp Layer 1 ({test_symbol}) ඇතුළත් විය!"
-                                    break
+                                    return
+            else:
+                downtrend_detected = True
+
+        # කිසිදු Trade එකක් Open නොවූයේ නම් පරිශීලකයාට පැහැදිලි Status එකක් පෙන්වයි
+        with state_lock:
+            if downtrend_detected and not active_position:
+                bot_state["status_message"] = f"🛡️ Downtrend ආරක්ෂාව ක්‍රියාත්මකයි (මිල < EMA 200). පාඩු වැළැක්වීමට මුදල් ආරක්ෂා කරමින් Uptrend එකක් බලාපොරොත්තුවෙන් සිටී..."
+            else:
+                bot_state["status_message"] = "Multi-Pair Ultra Scalp Scanner (ETH/SOL/BTC) Uptrend අවස්ථා නිරීක්ෂණය කරමින් පවතී..."
 
 def bot_worker():
     while True:
