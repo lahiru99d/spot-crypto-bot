@@ -199,7 +199,7 @@ def save_trade_to_db(entry_time, exit_time, symbol, side, entry_price, exit_pric
         logger.error(f"❌ Save trade error: {e}")
 
 # ============================================
-# 🧠 IMPROVED ML MODEL (NO GROQ)
+# 🧠 IMPROVED ML MODEL (RELAXED THRESHOLD)
 # ============================================
 def train_and_predict_ml(df):
     """Pure ML prediction without external API"""
@@ -207,7 +207,7 @@ def train_and_predict_ml(df):
         if len(df) < 150:
             return "NEUTRAL", 50.0
 
-        # Better features
+        # Features
         df['price_momentum'] = (df['close'] - df['close'].shift(5)) / df['close'].shift(5) * 100
         df['rsi_trend'] = df['rsi'].diff()
         df['ema_alignment'] = (df['ema_20'] - df['ema_50']) / df['close'] * 100
@@ -246,9 +246,6 @@ def train_and_predict_ml(df):
         )
         model.fit(X_train_scaled, y_train)
         
-        test_score = model.score(X_test_scaled, y_test)
-        logger.info(f"📈 ML Accuracy: {test_score:.2%}")
-        
         # Predict
         latest_features = clean_df[features].iloc[-1:].values
         latest_scaled = scaler.transform(latest_features)
@@ -256,9 +253,10 @@ def train_and_predict_ml(df):
         
         prob_up = probs[1] * 100
         
-        if prob_up >= 55.0:
+        # 🟢 RELAXED: 55% -> 51%
+        if prob_up >= 51.0:
             return "LONG", round(prob_up, 1)
-        elif prob_up <= 45.0:
+        elif prob_up <= 49.0:
             return "SHORT", round(100 - prob_up, 1)
         else:
             return "NEUTRAL", 50.0
@@ -268,45 +266,39 @@ def train_and_predict_ml(df):
         return "NEUTRAL", 50.0
 
 # ============================================
-# 📊 TECHNICAL SIGNALS (PURE INDICATORS)
+# 📊 TECHNICAL SIGNALS (RELAXED CONDITIONS)
 # ============================================
 def get_technical_signal(ind, df):
-    """Generate signal purely from technical indicators"""
+    """Generate signal purely from technical indicators (Relaxed for faster trades)"""
     
-    # Trend
-    ema_bullish = ind["ema_20"] > ind["ema_50"] > ind["ema_200"]
-    ema_bearish = ind["ema_20"] < ind["ema_50"] < ind["ema_200"]
+    # Short-term trends
+    price_above_ema20 = ind["current_price"] >= ind["ema_20"]
+    ema_short_bullish = ind["ema_20"] >= ind["ema_50"]
     
     # Momentum
     macd_bullish = ind["macd"] > ind["macd_signal"]
-    macd_bearish = ind["macd"] < ind["macd_signal"]
     
-    # Oscillator
-    rsi_oversold = ind["rsi"] < 30
-    rsi_oversought = ind["rsi"] > 70
-    rsi_ok = 30 <= ind["rsi"] <= 72
+    # RSI filter
+    rsi_ok = 35 <= ind["rsi"] <= 68
+    rsi_bounce = (ind["rsi"] < 45) and macd_bullish
     
-    # Price action
-    price_above_ema = ind["current_price"] > ind["ema_20"]
+    # ===== LONG SIGNALS =====
+    # 1. Price above EMA 20 with Bullish MACD & Safe RSI
+    if price_above_ema20 and macd_bullish and rsi_ok:
+        return "LONG", 70.0
     
-    # ===== LONG SIGNAL =====
-    if (ema_bullish and macd_bullish and rsi_ok and price_above_ema):
-        return "LONG", 75.0
+    # 2. Short-term EMA Bullish Alignment
+    if ema_short_bullish and macd_bullish and rsi_ok:
+        return "LONG", 60.0
     
-    if (ema_bullish and macd_bullish and rsi_ok):
-        return "LONG", 65.0
-    
-    if (ema_bullish and rsi_ok and not rsi_oversought):
+    # 3. Pullback / Oversold bounce signal
+    if rsi_bounce:
         return "LONG", 55.0
     
-    # ===== SHORT SIGNAL =====
-    if (ema_bearish and macd_bearish and rsi_ok):
-        return "SHORT", 75.0
+    # Bearish check
+    if not macd_bullish and ind["rsi"] < 40:
+        return "SHORT", 60.0
     
-    if (ema_bearish and macd_bearish):
-        return "SHORT", 65.0
-    
-    # Neutral
     return "NEUTRAL", 50.0
 
 # ============================================
@@ -412,8 +404,6 @@ def get_klines_and_indicators(symbol):
             "ema_200_series": ema_200_list[-100:]
         }
         
-        logger.info(f"📊 RSI={indicators['rsi']:.1f} | MACD={'▲' if indicators['macd'] > indicators['macd_signal'] else '▼'} | Price=${indicators['current_price']:.2f}")
-        
         return chart_candles[-100:], indicators, df
         
     except Exception as e:
@@ -497,7 +487,7 @@ def place_market_order(symbol, side, quote_qty, mode):
 # 🎯 MAIN TRADING LOGIC
 # ============================================
 def process_bot_logic(symbol, mode, risk_pct):
-    """Main bot logic - NO GROQ"""
+    """Main bot logic"""
     global active_position, last_trade_time
     
     candles, ind, df = get_klines_and_indicators(symbol)
@@ -511,7 +501,7 @@ def process_bot_logic(symbol, mode, risk_pct):
     ml_signal, ml_conf = train_and_predict_ml(df)
     tech_signal, tech_conf = get_technical_signal(ind, df)
     
-    # Final signal - both must agree
+    # Final signal - both agree
     final_signal = "NEUTRAL"
     if ml_signal == "LONG" and tech_signal == "LONG":
         final_signal = "LONG"
@@ -550,9 +540,9 @@ def process_bot_logic(symbol, mode, risk_pct):
         unrealized_pnl = (current_price - avg_price) * total_qty
         unrealized_pnl_pct = (unrealized_pnl / active_position["total_cost"]) * 100
         
-        # Try add layer
-        if len(layers) < 3 and current_price <= active_position["last_layer_price"] * 0.98:
-            if ind["rsi"] < 40:
+        # DCA Layer add
+        if len(layers) < 3 and current_price <= active_position["last_layer_price"] * 0.985:
+            if ind["rsi"] < 45:
                 with state_lock:
                     balance = bot_state["current_balance"]
                 
@@ -645,9 +635,9 @@ def process_bot_logic(symbol, mode, risk_pct):
             with state_lock:
                 bot_state["status_message"] = f"Waiting... | Tech: {tech_signal} {tech_conf:.0f}% | ML: {ml_signal} {ml_conf:.0f}%"
             
-            # Entry if both signals agree
-            if final_signal == "LONG" and ml_conf >= 55 and tech_conf >= 60:
-                logger.info(f"🚀 Entry: LONG | ML: {ml_conf}% | Tech: {tech_conf}%")
+            # 🟢 RELAXED ENTRY: ML >= 51 and Tech >= 55
+            if final_signal == "LONG" and ml_conf >= 51 and tech_conf >= 55:
+                logger.info(f"🚀 Entry Triggered: LONG | ML: {ml_conf}% | Tech: {tech_conf}%")
                 
                 with state_lock:
                     balance = bot_state["current_balance"]
@@ -686,7 +676,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                         with state_lock:
                             bot_state["status_message"] = f"ENTRY @ ${current_price} | TP: ${tp_price} | SL: ${sl_price}"
                         
-                        logger.info(f"✅ Position opened")
+                        logger.info(f"✅ Position opened successfully!")
 
 def bot_worker():
     """Worker thread"""
@@ -869,10 +859,6 @@ if __name__ == "__main__":
     init_db()
     load_db_history()
     logger.info("=" * 60)
-    logger.info("🤖 CRYPTO SPOT DCA TRADING BOT (NO GROQ)")
-    logger.info("=" * 60)
-    logger.info("✅ Technical Indicators: RSI, EMA, MACD, ATR")
-    logger.info("✅ ML Model: RandomForest (100 trees)")
-    logger.info("✅ No external API dependency")
+    logger.info("🤖 CRYPTO SPOT DCA TRADING BOT (ACTIVE TRADING)")
     logger.info("=" * 60)
     app.run(debug=False, port=5000, threaded=True)
