@@ -13,13 +13,17 @@ import numpy as np
 import requests
 from datetime import datetime
 from flask import Flask, jsonify, request
-from dotenv import load_dotenv
+
+# Safe dotenv import (Never crashes deploy even if missing)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # ============================================
 # 🔒 CONFIGURATION & LOGGING
 # ============================================
-load_dotenv()
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -34,7 +38,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 
 DB_FILE = "bot_memory.db"
-TRADE_COOLDOWN_SECONDS = 10  # Reduced to 10s for faster trading
+TRADE_COOLDOWN_SECONDS = 10
 TIMEFRAME = "3m"
 
 app = Flask(__name__)
@@ -88,7 +92,7 @@ bot_state = {
 active_position = None
 last_trade_time = 0
 state_lock = threading.Lock()
-worker_thread_started = False
+worker_thread = None
 
 # ============================================
 # 🗄️ SAFE DATABASE HANDLERS
@@ -196,10 +200,6 @@ def save_trade_to_db(entry_time, exit_time, symbol, side, entry_price, exit_pric
 # 🎯 PURE TECHNICAL FAST SCALPING STRATEGY
 # ============================================
 def get_technical_signal(ind):
-    """
-    Fast Scalping Indicator Engine:
-    Triggered by Pullbacks, Momentum curls & Dip Reversals.
-    """
     price = ind["current_price"]
     ema20 = ind["ema_20"]
     ema50 = ind["ema_50"]
@@ -210,51 +210,54 @@ def get_technical_signal(ind):
     macd_bullish = macd > macd_signal
     macd_hist = macd - macd_signal
 
-    # 1. SETUP A: Dip Pullback Bounce (Highest win rate for Spot)
-    # Price dips but MACD starts curling up, RSI recovering from oversold
+    # 1. SETUP A: Dip Pullback Bounce (Quick Reversal)
     if (32 <= rsi <= 48) and (macd_bullish or macd_hist > -0.5):
         return "LONG", 80.0
 
     # 2. SETUP B: Trend Momentum Scalp
-    # Price is above EMA 20, EMA 20 above EMA 50, MACD positive, healthy RSI
     if (price >= ema20 * 0.998) and (ema20 >= ema50) and macd_bullish and (45 <= rsi <= 68):
         return "LONG", 75.0
 
-    # 3. SETUP C: Extreme Oversold Bounce
-    # Quick knife-catch scalp when RSI drops low
+    # 3. SETUP C: Oversold Rebound
     if rsi < 35:
         return "LONG", 70.0
 
-    # Neutral if overbought or dropping hard
+    # Neutral / Drop check
     if rsi > 70 or (not macd_bullish and rsi < 32):
         return "SHORT", 60.0
 
     return "NEUTRAL", 50.0
 
 # ============================================
-# 📊 BINANCE MARKET DATA
+# 📊 SAFE BINANCE MULTI-ENDPOINT FETCHER
 # ============================================
 def get_klines_and_indicators(symbol):
+    # Backup endpoints prevent US/Datacenter IP blocks
+    endpoints = [
+        "https://api1.binance.com/api/v3/klines",
+        "https://api.binance.com/api/v3/klines",
+        "https://data-api.binance.vision/api/v3/klines"
+    ]
+    
+    data = None
+    params = {"symbol": symbol, "interval": TIMEFRAME, "limit": 180}
+    
+    for url in endpoints:
+        try:
+            res = requests.get(url, params=params, timeout=(3.0, 5.0))
+            if res.status_code == 200:
+                data = res.json()
+                if data and len(data) >= 80:
+                    break
+            elif res.status_code == 429:
+                time.sleep(5)
+        except Exception:
+            continue
+
+    if not data or len(data) < 80:
+        return None, None
+
     try:
-        params = {"symbol": symbol, "interval": TIMEFRAME, "limit": 180}
-        response = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params=params,
-            timeout=(3.0, 5.0)
-        )
-        
-        if response.status_code == 429:
-            logger.warning("⚠️ Binance Rate limit warning! Cooling down 10s...")
-            time.sleep(10)
-            return None, None
-        
-        if response.status_code != 200:
-            return None, None
-        
-        data = response.json()
-        if not data or len(data) < 80:
-            return None, None
-        
         df = pd.DataFrame(data, columns=[
             'time', 'open', 'high', 'low', 'close', 'volume',
             'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
@@ -292,7 +295,7 @@ def get_klines_and_indicators(symbol):
         df['atr'] = tr.rolling(window=14).mean()
         df['volatility'] = close.pct_change().rolling(window=15).std() * 100
 
-        # Lightweight candles for UI
+        # Small payload for chart
         chart_candles = []
         ema_20_list, ema_50_list, ema_200_list = [], [], []
         tail_df = df.tail(80)
@@ -327,13 +330,9 @@ def get_klines_and_indicators(symbol):
             "ema_50_series": ema_50_list,
             "ema_200_series": ema_200_list
         }
-        
         return chart_candles, indicators
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"⚠️ Network error: {e}")
-        return None, None
     except Exception as e:
-        logger.error(f"❌ Indicator calculation error: {e}")
+        logger.error(f"❌ Parse indicator error: {e}")
         return None, None
 
 # ============================================
@@ -346,15 +345,14 @@ def calculate_dca_levels(layers):
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
-    # Quick Scalp TP targets
     if len(layers) == 1:
-        tp_ratio = 1.015  # +1.5% Take Profit (Fast flip)
-        sl_ratio = 0.980  # -2.0% Stop Loss
+        tp_ratio = 1.015  # +1.5% Quick Scalp TP
+        sl_ratio = 0.980  # -2.0% SL
     elif len(layers) == 2:
-        tp_ratio = 1.012  # +1.2% (Quick average-out)
+        tp_ratio = 1.012  # +1.2%
         sl_ratio = 0.975  # -2.5%
     else:
-        tp_ratio = 1.010  # +1.0%
+        tp_ratio = 1.010
         sl_ratio = 0.970
 
     return (round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), 
@@ -408,7 +406,6 @@ def process_bot_logic(symbol, mode, risk_pct):
     current_time = time.time()
     current_price = ind["current_price"]
     
-    # Pure technical signal evaluation (Microseconds)
     tech_signal, tech_conf = get_technical_signal(ind)
     final_signal = tech_signal
     
@@ -445,7 +442,7 @@ def process_bot_logic(symbol, mode, risk_pct):
         
         unrealized_pnl = (current_price - avg_price) * total_qty
         
-        # DCA Layer Add: Drops by 1.4% and RSI confirms dip
+        # DCA Layer Add: Drop by 1.4% and safe dip RSI
         if len(layers) < 3 and current_price <= active_position["last_layer_price"] * 0.986:
             if ind["rsi"] < 48:
                 with state_lock:
@@ -519,7 +516,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                     f"TP: ${tp_price} | SL: ${sl_price} | PnL: ${unrealized_pnl:.2f}"
                 )
 
-    # ===== LOOK FOR INSTANT SCALPING ENTRY =====
+    # ===== LOOK FOR SCALPING ENTRY =====
     else:
         cooldown = TRADE_COOLDOWN_SECONDS
         if (current_time - last_trade_time) < cooldown:
@@ -529,7 +526,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             with state_lock:
                 bot_state["status_message"] = f"Scanning... | Signal: {tech_signal} ({tech_conf:.0f}%) | RSI: {ind['rsi']}"
 
-            # Instant trigger on technical setup (No AI barrier!)
+            # Instant trigger on setup
             if final_signal == "LONG" and tech_conf >= 65:
                 with state_lock:
                     balance = bot_state["current_balance"]
@@ -589,16 +586,20 @@ def bot_worker():
             logger.error(traceback.format_exc())
             time.sleep(5)
         
-        time.sleep(5)  # 5-second responsive check
+        time.sleep(5)
 
 def start_worker_safely():
-    global worker_thread_started
-    if not worker_thread_started:
-        with state_lock:
-            if not worker_thread_started:
-                t = threading.Thread(target=bot_worker, daemon=True)
-                t.start()
-                worker_thread_started = True
+    global worker_thread
+    with state_lock:
+        # Auto-Revive if thread was never started or died
+        if worker_thread is None or not worker_thread.is_alive():
+            worker_thread = threading.Thread(target=bot_worker, daemon=True)
+            worker_thread.start()
+            logger.info("🚀 Background Worker Thread (Re)started Successfully!")
+
+# Initialize Database on Gunicorn load
+init_db()
+load_db_history()
 
 # ============================================
 # 🌐 FLASK API ENDPOINTS
@@ -742,10 +743,5 @@ def export_csv():
 # ▶️ ENTRY POINT
 # ============================================
 if __name__ == "__main__":
-    init_db()
-    load_db_history()
-    logger.info("=" * 60)
-    logger.info("🤖 PURE TECHNICAL SPOT DCA SCALPER READY")
-    logger.info("=" * 60)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
