@@ -1,27 +1,27 @@
 import os
+import gc
 import time
 import hmac
 import hashlib
 import urllib.parse
 import threading
-import json
 import sqlite3
 import logging
+import traceback
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask, jsonify, request
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from dotenv import load_dotenv
 
 # ============================================
-# 🔒 CONFIGURATION & SECURITY
+# 🔒 CONFIGURATION & LOGGING
 # ============================================
 load_dotenv()
 
-# Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -32,13 +32,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Binance API Credentials
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 
-# Bot configuration
 DB_FILE = "bot_memory.db"
 TRADE_COOLDOWN_SECONDS = 15
+TIMEFRAME = "3m"
 
 app = Flask(__name__)
 
@@ -65,7 +64,7 @@ bot_state = {
     "consecutive_losses": 0,
     
     # Technical indicators
-    "current_rsi": 0.0,
+    "current_rsi": 50.0,
     "current_ema_20": 0.0,
     "current_ema_50": 0.0,
     "current_ema_200": 0.0,
@@ -76,7 +75,7 @@ bot_state = {
     
     # AI signals
     "ml_signal": "NEUTRAL",
-    "ml_confidence": 0.0,
+    "ml_confidence": 50.0,
     "technical_signal": "NEUTRAL",
     "final_signal": "NEUTRAL",
     
@@ -93,13 +92,22 @@ last_trade_time = 0
 state_lock = threading.Lock()
 worker_thread_started = False
 
+# AI Model Cache in Memory (No repeated fits)
+ml_model = None
+ml_scaler = None
+last_model_train_time = 0
+
 # ============================================
-# 🗄️ DATABASE
+# 🗄️ SAFE DATABASE HANDLERS
 # ============================================
+def get_db_connection():
+    """Returns sqlite connection with safety timeout"""
+    conn = sqlite3.connect(DB_FILE, timeout=20.0)
+    return conn
+
 def init_db():
-    """Initialize SQLite database"""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS trade_history (
@@ -122,16 +130,14 @@ def init_db():
         ''')
         conn.commit()
         conn.close()
-        logger.info("✅ Database initialized!")
+        logger.info("✅ Database initialized safely!")
     except Exception as e:
-        logger.error(f"❌ Database error: {e}")
+        logger.error(f"❌ Database init error: {e}")
 
 def load_db_history():
-    """Load trade history"""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
-        
         cursor.execute("""
             SELECT timestamp, symbol, side, entry_price, exit_price, 
                    layers, tp, sl, pnl, outcome FROM trade_history 
@@ -173,16 +179,13 @@ def load_db_history():
             bot_state["accuracy"] = acc
             bot_state["current_profit"] = tot_pnl
 
-        logger.info(f"📊 Loaded {len(history_trades)} trades | Win Rate: {acc}%")
-        
     except Exception as e:
         logger.error(f"❌ Load history error: {e}")
 
 def save_trade_to_db(entry_time, exit_time, symbol, side, entry_price, exit_price, 
                      layers, tp, sl, rsi, macd, ml_conf, pnl, outcome):
-    """Save trade"""
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO trade_history 
@@ -194,133 +197,130 @@ def save_trade_to_db(entry_time, exit_time, symbol, side, entry_price, exit_pric
         conn.commit()
         conn.close()
         load_db_history()
-        logger.info(f"💾 Trade: {outcome} | PnL: ${pnl:.2f}")
+        logger.info(f"💾 Trade Saved: {outcome} | PnL: ${pnl:.2f}")
     except Exception as e:
         logger.error(f"❌ Save trade error: {e}")
 
 # ============================================
-# 🧠 IMPROVED ML MODEL (RELAXED THRESHOLD)
+# 🧠 LOW-RAM ML MODEL (NO CONTINUOUS FITTING)
 # ============================================
-def train_and_predict_ml(df):
-    """Pure ML prediction without external API"""
+FEATURE_COLS = ['rsi', 'price_momentum', 'ema_diff', 'macd_hist', 'volatility', 'atr']
+
+def train_or_update_model(df):
+    """Trains a ultra-lightweight model only once every 4 hours"""
+    global ml_model, ml_scaler, last_model_train_time
+    now = time.time()
+    
+    # Only train if model doesn't exist or 4 hours elapsed
+    if ml_model is not None and (now - last_model_train_time < 14400):
+        return
+
     try:
-        if len(df) < 150:
-            return "NEUTRAL", 50.0
+        clean_df = df[FEATURE_COLS + ['target']].dropna().copy()
+        if len(clean_df) < 80:
+            return
 
-        # Features
-        df['price_momentum'] = (df['close'] - df['close'].shift(5)) / df['close'].shift(5) * 100
-        df['rsi_trend'] = df['rsi'].diff()
-        df['ema_alignment'] = (df['ema_20'] - df['ema_50']) / df['close'] * 100
-        df['macd_histogram'] = df['macd'] - df['macd_signal']
-        df['volatility'] = df['close'].rolling(10).std() / df['close'] * 100
-        
-        df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
-        
-        features = ['rsi', 'price_momentum', 'rsi_trend', 'ema_alignment', 
-                   'macd_histogram', 'volatility', 'atr']
-        
-        clean_df = df[features + ['target']].dropna().copy()
-        
-        if len(clean_df) < 100:
-            return "NEUTRAL", 50.0
+        X = clean_df[FEATURE_COLS]
+        y = clean_df['target']
 
-        # Train/test split
-        train_size = int(len(clean_df) * 0.8)
-        X_train = clean_df[features][:train_size]
-        y_train = clean_df['target'][:train_size]
-        X_test = clean_df[features][train_size:]
-        y_test = clean_df['target'][train_size:]
-        
-        # Scale
         scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-        
-        # Train
+        X_scaled = scaler.fit_transform(X)
+
+        # Ultra-light model: 30 trees, max depth 4 (takes < 15MB RAM)
         model = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=6,
-            min_samples_split=10,
-            min_samples_leaf=5,
-            random_state=42
+            n_estimators=30,
+            max_depth=4,
+            min_samples_split=8,
+            min_samples_leaf=4,
+            random_state=42,
+            n_jobs=1
         )
-        model.fit(X_train_scaled, y_train)
+        model.fit(X_scaled, y)
+
+        ml_model = model
+        ml_scaler = scaler
+        last_model_train_time = now
+        logger.info("🧠 AI Model loaded & cached safely in memory.")
         
-        # Predict
-        latest_features = clean_df[features].iloc[-1:].values
-        latest_scaled = scaler.transform(latest_features)
-        probs = model.predict_proba(latest_scaled)[0]
-        
-        prob_up = probs[1] * 100
-        
-        # 🟢 RELAXED: 55% -> 51%
-        if prob_up >= 51.0:
+        # Free memory
+        del clean_df, X, y, X_scaled
+        gc.collect()
+    except Exception as e:
+        logger.error(f"❌ Model training error: {e}")
+
+def predict_ml(df):
+    """Fast prediction using cached model without memory leak"""
+    global ml_model, ml_scaler
+    if ml_model is None or ml_scaler is None:
+        train_or_update_model(df)
+        if ml_model is None:
+            return "NEUTRAL", 50.0
+
+    try:
+        latest = df[FEATURE_COLS].iloc[-1:].values
+        if np.isnan(latest).any():
+            return "NEUTRAL", 50.0
+
+        latest_scaled = ml_scaler.transform(latest)
+        prob_up = ml_model.predict_proba(latest_scaled)[0][1] * 100
+
+        if prob_up >= 52.0:
             return "LONG", round(prob_up, 1)
-        elif prob_up <= 49.0:
+        elif prob_up <= 45.0:
             return "SHORT", round(100 - prob_up, 1)
         else:
             return "NEUTRAL", 50.0
-
-    except Exception as e:
-        logger.error(f"❌ ML error: {e}")
+    except Exception:
         return "NEUTRAL", 50.0
 
 # ============================================
-# 📊 TECHNICAL SIGNALS (RELAXED CONDITIONS)
+# 📊 TECHNICAL STRATEGY
 # ============================================
-def get_technical_signal(ind, df):
-    """Generate signal purely from technical indicators (Relaxed for faster trades)"""
-    
-    # Short-term trends
-    price_above_ema20 = ind["current_price"] >= ind["ema_20"]
-    ema_short_bullish = ind["ema_20"] >= ind["ema_50"]
-    
-    # Momentum
+def get_technical_signal(ind):
+    price = ind["current_price"]
+    ema20 = ind["ema_20"]
+    ema50 = ind["ema_50"]
     macd_bullish = ind["macd"] > ind["macd_signal"]
-    
-    # RSI filter
-    rsi_ok = 35 <= ind["rsi"] <= 68
-    rsi_bounce = (ind["rsi"] < 45) and macd_bullish
-    
-    # ===== LONG SIGNALS =====
-    # 1. Price above EMA 20 with Bullish MACD & Safe RSI
-    if price_above_ema20 and macd_bullish and rsi_ok:
+    rsi = ind["rsi"]
+
+    # Short-term momentum check
+    trend_up = (price >= ema20) and (ema20 >= ema50)
+    pullback_bounce = (rsi < 48) and macd_bullish and (price >= ema20 * 0.997)
+
+    if trend_up and macd_bullish and (38 <= rsi <= 70):
         return "LONG", 70.0
-    
-    # 2. Short-term EMA Bullish Alignment
-    if ema_short_bullish and macd_bullish and rsi_ok:
+
+    if pullback_bounce and (35 <= rsi <= 55):
         return "LONG", 60.0
-    
-    # 3. Pullback / Oversold bounce signal
-    if rsi_bounce:
-        return "LONG", 55.0
-    
-    # Bearish check
-    if not macd_bullish and ind["rsi"] < 40:
+
+    if not macd_bullish and rsi < 38:
         return "SHORT", 60.0
-    
+
     return "NEUTRAL", 50.0
 
 # ============================================
-# 📊 TECHNICAL ANALYSIS
+# 📊 SAFE BINANCE FETCHER (ANTI-BLOCKING)
 # ============================================
 def get_klines_and_indicators(symbol):
-    """Fetch and calculate indicators"""
     try:
-        params = {"symbol": symbol, "interval": "3m", "limit": 300}
+        params = {"symbol": symbol, "interval": TIMEFRAME, "limit": 200}
+        # Connection timeout: 3.5s, Read timeout: 5s
         response = requests.get(
             "https://api.binance.com/api/v3/klines",
             params=params,
-            timeout=5
+            timeout=(3.5, 5.0)
         )
         
+        if response.status_code == 429:
+            logger.warning("⚠️ Binance Rate limit warning (429)! Cooling down...")
+            time.sleep(10)
+            return None, None, None
+
         if response.status_code != 200:
-            logger.error(f"❌ Klines error: {response.status_code}")
             return None, None, None
         
         data = response.json()
-        if not data or len(data) < 200:
-            logger.warning("⚠️ Insufficient data")
+        if not data or len(data) < 100:
             return None, None, None
         
         df = pd.DataFrame(data, columns=[
@@ -336,58 +336,56 @@ def get_klines_and_indicators(symbol):
         high = df['high']
         low = df['low']
         
-        # EMAs
+        # Fast indicator computation
         df['ema_20'] = close.ewm(span=20, adjust=False).mean()
         df['ema_50'] = close.ewm(span=50, adjust=False).mean()
         df['ema_200'] = close.ewm(span=200, adjust=False).mean()
         
-        # RSI
         delta = close.diff()
-        gain = delta.clip(lower=0)
-        loss = -1 * delta.clip(upper=0)
-        ema_gain = gain.ewm(com=13, adjust=False).mean()
-        ema_loss = loss.ewm(com=13, adjust=False).mean()
-        rs = ema_gain / (ema_loss + 1e-10)
+        gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
+        loss = (-1 * delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
+        rs = gain / (loss + 1e-10)
         df['rsi'] = 100 - (100 / (1 + rs))
         
-        # MACD
         ema_12 = close.ewm(span=12, adjust=False).mean()
         ema_26 = close.ewm(span=26, adjust=False).mean()
         df['macd'] = ema_12 - ema_26
         df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
         
-        # ATR
-        tr1 = high - low
-        tr2 = (high - close.shift()).abs()
-        tr3 = (low - close.shift()).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs()
+        ], axis=1).max(axis=1)
         df['atr'] = tr.rolling(window=14).mean()
+        df['volatility'] = close.pct_change().rolling(window=15).std() * 100
         
-        # Volatility
-        df['volatility'] = close.pct_change().rolling(window=20).std() * 100
-        
-        # Chart data
+        # Features for AI
+        df['price_momentum'] = (close - close.shift(4)) / close.shift(4) * 100
+        df['ema_diff'] = (df['ema_20'] - df['ema_50']) / close * 100
+        df['macd_hist'] = df['macd'] - df['macd_signal']
+        df['target'] = (close.shift(-1) > close).astype(int)
+
+        # Build lightweight candle slice for chart
         chart_candles = []
-        ema_20_list = []
-        ema_50_list = []
-        ema_200_list = []
-        
-        for i in range(len(df)):
-            t = int(df['time'].iloc[i])
+        ema_20_list, ema_50_list, ema_200_list = [], [], []
+        tail_df = df.tail(80)  # Keep payload small
+
+        for idx, row in tail_df.iterrows():
+            t = int(row['time'])
             chart_candles.append({
                 "time": t,
-                "open": float(df['open'].iloc[i]),
-                "high": float(df['high'].iloc[i]),
-                "low": float(df['low'].iloc[i]),
-                "close": float(df['close'].iloc[i])
+                "open": float(row['open']),
+                "high": float(row['high']),
+                "low": float(row['low']),
+                "close": float(row['close'])
             })
-            
-            if not np.isnan(df['ema_20'].iloc[i]):
-                ema_20_list.append({"time": t, "value": float(df['ema_20'].iloc[i])})
-            if not np.isnan(df['ema_50'].iloc[i]):
-                ema_50_list.append({"time": t, "value": float(df['ema_50'].iloc[i])})
-            if not np.isnan(df['ema_200'].iloc[i]):
-                ema_200_list.append({"time": t, "value": float(df['ema_200'].iloc[i])})
+            if not np.isnan(row['ema_20']):
+                ema_20_list.append({"time": t, "value": float(row['ema_20'])})
+            if not np.isnan(row['ema_50']):
+                ema_50_list.append({"time": t, "value": float(row['ema_50'])})
+            if not np.isnan(row['ema_200']):
+                ema_200_list.append({"time": t, "value": float(row['ema_200'])})
         
         indicators = {
             "rsi": round(float(df['rsi'].iloc[-1]), 2),
@@ -399,51 +397,47 @@ def get_klines_and_indicators(symbol):
             "atr": round(float(df['atr'].iloc[-1]), 4),
             "volatility": round(float(df['volatility'].iloc[-1]), 2),
             "current_price": float(close.iloc[-1]),
-            "ema_20_series": ema_20_list[-100:],
-            "ema_50_series": ema_50_list[-100:],
-            "ema_200_series": ema_200_list[-100:]
+            "ema_20_series": ema_20_list,
+            "ema_50_series": ema_50_list,
+            "ema_200_series": ema_200_list
         }
         
-        return chart_candles[-100:], indicators, df
-        
+        return chart_candles, indicators, df
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"⚠️ Network timeout/error: {e}")
+        return None, None, None
     except Exception as e:
-        logger.error(f"❌ Klines error: {e}")
+        logger.error(f"❌ Indicator parse error: {e}")
         return None, None, None
 
 # ============================================
 # 💹 POSITION MANAGEMENT
 # ============================================
 def calculate_dca_levels(layers):
-    """Calculate DCA levels"""
     if not layers:
         return None
-    
     total_qty = sum(l["qty"] for l in layers)
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
-    
+
     if len(layers) == 1:
-        tp_ratio = 1.025
-        sl_ratio = 0.985
+        tp_ratio = 1.020  # +2.0%
+        sl_ratio = 0.980  # -2.0%
     elif len(layers) == 2:
-        tp_ratio = 1.020
-        sl_ratio = 0.980
+        tp_ratio = 1.015  # +1.5%
+        sl_ratio = 0.975  # -2.5%
     else:
-        tp_ratio = 1.015
-        sl_ratio = 0.975
-    
-    tp_price = round(avg_price * tp_ratio, 4)
-    sl_price = round(avg_price * sl_ratio, 4)
-    
-    return round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), tp_price, sl_price
+        tp_ratio = 1.012
+        sl_ratio = 0.970
+
+    return (round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), 
+            round(avg_price * tp_ratio, 4), round(avg_price * sl_ratio, 4))
 
 def place_market_order(symbol, side, quote_qty, mode):
-    """Place order"""
     if mode == "paper":
         return {"orderId": "PAPER_" + str(int(time.time())), "status": "FILLED"}
     
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
-        logger.error("❌ API credentials missing")
         return None
     
     try:
@@ -454,7 +448,6 @@ def place_market_order(symbol, side, quote_qty, mode):
             "quoteOrderQty": round(quote_qty, 2),
             "timestamp": int(time.time() * 1000)
         }
-        
         query_string = urllib.parse.urlencode(params)
         signature = hmac.new(
             BINANCE_API_SECRET.encode(),
@@ -462,32 +455,23 @@ def place_market_order(symbol, side, quote_qty, mode):
             hashlib.sha256
         ).hexdigest()
         params["signature"] = signature
-        
         headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
         
-        response = requests.post(
+        res = requests.post(
             "https://api.binance.com/api/v3/order",
             params=params,
             headers=headers,
             timeout=5
         )
-        
-        if response.status_code == 200:
-            logger.info(f"✅ Order: {side} {quote_qty} USDT")
-            return response.json()
-        else:
-            logger.error(f"❌ Order failed: {response.text}")
-            return None
-            
+        return res.json() if res.status_code == 200 else None
     except Exception as e:
         logger.error(f"❌ Order error: {e}")
         return None
 
 # ============================================
-# 🎯 MAIN TRADING LOGIC
+# 🎯 CORE TRADING LOGIC
 # ============================================
 def process_bot_logic(symbol, mode, risk_pct):
-    """Main bot logic"""
     global active_position, last_trade_time
     
     candles, ind, df = get_klines_and_indicators(symbol)
@@ -497,16 +481,17 @@ def process_bot_logic(symbol, mode, risk_pct):
     current_time = time.time()
     current_price = ind["current_price"]
     
-    # Signals
-    ml_signal, ml_conf = train_and_predict_ml(df)
-    tech_signal, tech_conf = get_technical_signal(ind, df)
+    # Train model safely in background if needed
+    train_or_update_model(df)
     
-    # Final signal - both agree
+    ml_signal, ml_conf = predict_ml(df)
+    tech_signal, tech_conf = get_technical_signal(ind)
+    
     final_signal = "NEUTRAL"
-    if ml_signal == "LONG" and tech_signal == "LONG":
+    if tech_signal == "LONG" and (ml_signal == "LONG" or ml_conf >= 50.0):
         final_signal = "LONG"
     
-    # Update state
+    # Update state for dashboard
     with state_lock:
         bot_state["current_price"] = current_price
         bot_state["candles"] = candles
@@ -525,11 +510,11 @@ def process_bot_logic(symbol, mode, risk_pct):
         bot_state["ml_confidence"] = ml_conf
         bot_state["technical_signal"] = tech_signal
         bot_state["final_signal"] = final_signal
-    
+
     if not bot_state["is_running"]:
         return
-    
-    # ===== MANAGE EXISTING POSITION =====
+
+    # ===== MANAGE ACTIVE TRADE =====
     if active_position:
         layers = active_position["layers"]
         avg_price = active_position["avg_price"]
@@ -538,9 +523,8 @@ def process_bot_logic(symbol, mode, risk_pct):
         sl_price = active_position["sl_price"]
         
         unrealized_pnl = (current_price - avg_price) * total_qty
-        unrealized_pnl_pct = (unrealized_pnl / active_position["total_cost"]) * 100
         
-        # DCA Layer add
+        # Check DCA Layer buy
         if len(layers) < 3 and current_price <= active_position["last_layer_price"] * 0.985:
             if ind["rsi"] < 45:
                 with state_lock:
@@ -550,7 +534,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 next_layer_qty = round(next_layer_usd / current_price, 4)
                 
                 order = place_market_order(symbol, "BUY", next_layer_usd, mode)
-                if order and "orderId" in order:
+                if order and ("orderId" in order or mode == "paper"):
                     layers.append({
                         "layer": len(layers) + 1,
                         "price": current_price,
@@ -558,37 +542,27 @@ def process_bot_logic(symbol, mode, risk_pct):
                         "cost": next_layer_usd,
                         "time": datetime.now().strftime("%H:%M:%S")
                     })
-                    
-                    avg_price, total_qty, total_cost, tp_price, sl_price = calculate_dca_levels(layers)
-                    active_position["layers"] = layers
-                    active_position["avg_price"] = avg_price
-                    active_position["total_qty"] = total_qty
-                    active_position["total_cost"] = total_cost
-                    active_position["tp_price"] = tp_price
-                    active_position["sl_price"] = sl_price
-                    active_position["last_layer_price"] = current_price
-                    
-                    logger.info(f"📈 Layer {len(layers)} @ ${current_price}")
+                    avg_p, tot_q, tot_c, tp_p, sl_p = calculate_dca_levels(layers)
+                    active_position.update({
+                        "layers": layers, "avg_price": avg_p,
+                        "total_qty": tot_q, "total_cost": tot_c,
+                        "tp_price": tp_p, "sl_price": sl_p,
+                        "last_layer_price": current_price
+                    })
+                    logger.info(f"📈 DCA Layer {len(layers)} Executed @ ${current_price}")
         
-        # Check exit
+        # Check Exit conditions
         exit_reason = None
-        exit_price = None
-        
         if current_price >= tp_price:
             exit_reason = "TP_HIT"
-            exit_price = tp_price
         elif current_price <= sl_price:
             exit_reason = "SL_HIT"
-            exit_price = sl_price
-        elif unrealized_pnl_pct < -3 and ind["rsi"] > 75:
-            exit_reason = "REVERSAL"
-            exit_price = current_price
         
         if exit_reason:
+            exit_price = current_price
             gross_pnl = (exit_price - avg_price) * total_qty
-            trading_fee = active_position["total_cost"] * 0.002
+            trading_fee = (active_position["total_cost"] + (total_qty * exit_price)) * 0.001
             net_pnl = gross_pnl - trading_fee
-            
             outcome = f"{exit_reason} | {'WIN ✅' if net_pnl > 0 else 'LOSS ❌'}"
             
             order = place_market_order(symbol, "SELL", total_qty * exit_price, mode)
@@ -616,29 +590,25 @@ def process_bot_logic(symbol, mode, risk_pct):
                 
                 active_position = None
                 last_trade_time = current_time
-                logger.info(f"🎯 Position closed: {outcome} | PnL: ${net_pnl:.2f}")
-        
+                logger.info(f"🎯 Position Closed: {outcome} | PnL: ${net_pnl:.2f}")
         else:
-            status_msg = f"LONG {len(layers)}/3 | Avg: ${avg_price} | TP: ${tp_price} | SL: ${sl_price} | U/R: ${unrealized_pnl:.2f}"
             with state_lock:
-                bot_state["status_message"] = status_msg
-    
+                bot_state["status_message"] = (
+                    f"SPOT DCA (LONG {len(layers)}/3) | Avg: ${avg_price} | "
+                    f"TP: ${tp_price} | SL: ${sl_price} | PnL: ${unrealized_pnl:.2f}"
+                )
+
     # ===== LOOK FOR ENTRY =====
     else:
-        cooldown = 15
-        time_since_trade = current_time - last_trade_time
-        
-        if time_since_trade < cooldown:
+        cooldown = TRADE_COOLDOWN_SECONDS
+        if (current_time - last_trade_time) < cooldown:
             with state_lock:
-                bot_state["status_message"] = f"Cooldown: {int(cooldown - time_since_trade)}s"
+                bot_state["status_message"] = f"Cooldown: {int(cooldown - (current_time - last_trade_time))}s"
         else:
             with state_lock:
-                bot_state["status_message"] = f"Waiting... | Tech: {tech_signal} {tech_conf:.0f}% | ML: {ml_signal} {ml_conf:.0f}%"
+                bot_state["status_message"] = f"Scanning... | Tech: {tech_signal} ({tech_conf:.0f}%) | AI: {ml_signal} ({ml_conf:.0f}%)"
             
-            # 🟢 RELAXED ENTRY: ML >= 51 and Tech >= 55
-            if final_signal == "LONG" and ml_conf >= 51 and tech_conf >= 55:
-                logger.info(f"🚀 Entry Triggered: LONG | ML: {ml_conf}% | Tech: {tech_conf}%")
-                
+            if final_signal == "LONG" and tech_conf >= 60 and ml_conf >= 50:
                 with state_lock:
                     balance = bot_state["current_balance"]
                 
@@ -647,7 +617,6 @@ def process_bot_logic(symbol, mode, risk_pct):
                 
                 if entry_qty > 0 and balance >= 10:
                     order = place_market_order(symbol, "BUY", entry_usd, mode)
-                    
                     if order and ("orderId" in order or mode == "paper"):
                         entry_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         layers = [{
@@ -657,29 +626,28 @@ def process_bot_logic(symbol, mode, risk_pct):
                             "cost": entry_usd,
                             "time": datetime.now().strftime("%H:%M:%S")
                         }]
-                        
-                        avg_price, total_qty, total_cost, tp_price, sl_price = calculate_dca_levels(layers)
-                        
+                        avg_p, tot_q, tot_c, tp_p, sl_p = calculate_dca_levels(layers)
                         active_position = {
                             "entry_time": entry_time,
                             "layers": layers,
-                            "avg_price": avg_price,
-                            "total_qty": total_qty,
-                            "total_cost": total_cost,
-                            "tp_price": tp_price,
-                            "sl_price": sl_price,
+                            "avg_price": avg_p,
+                            "total_qty": tot_q,
+                            "total_cost": tot_c,
+                            "tp_price": tp_p,
+                            "sl_price": sl_p,
                             "last_layer_price": current_price,
                             "ml_signal": ml_signal,
                             "ml_conf": ml_conf
                         }
-                        
-                        with state_lock:
-                            bot_state["status_message"] = f"ENTRY @ ${current_price} | TP: ${tp_price} | SL: ${sl_price}"
-                        
-                        logger.info(f"✅ Position opened successfully!")
+                        logger.info(f"🚀 New Position opened @ ${current_price}")
 
+# ============================================
+# 🔄 BULLETPROOF WORKER LOOP (NO CRASHES)
+# ============================================
 def bot_worker():
-    """Worker thread"""
+    """Persistent, self-healing background worker"""
+    logger.info("🚀 Background Trading Worker Started Successfully!")
+    loop_count = 0
     while True:
         try:
             with state_lock:
@@ -691,10 +659,17 @@ def bot_worker():
             if is_running:
                 process_bot_logic(symbol, mode, risk_pct)
             
+            loop_count += 1
+            # Clean RAM every 20 loops (prevents Render 512MB RAM leaks)
+            if loop_count % 20 == 0:
+                gc.collect()
+
         except Exception as e:
-            logger.error(f"❌ Bot cycle error: {e}")
+            logger.error(f"⚠️ Recovered from worker loop error: {e}")
+            logger.error(traceback.format_exc())
+            time.sleep(5)
         
-        time.sleep(3)
+        time.sleep(6)  # Safe 6s delay (Prevents Binance 429 block)
 
 def start_worker_safely():
     global worker_thread_started
@@ -704,12 +679,10 @@ def start_worker_safely():
                 t = threading.Thread(target=bot_worker, daemon=True)
                 t.start()
                 worker_thread_started = True
-                logger.info("🚀 Worker started")
 
 # ============================================
-# 🌐 FLASK ROUTES
+# 🌐 FLASK API ENDPOINTS
 # ============================================
-
 @app.route("/")
 def index():
     start_worker_safely()
@@ -722,21 +695,17 @@ def index():
 @app.route("/api/start", methods=["POST"])
 def start_bot():
     start_worker_safely()
-    data = request.json
-    
+    data = request.json or {}
     with state_lock:
         bot_state["mode"] = data.get("mode", "paper")
         bot_state["symbol"] = data.get("symbol", "ETHUSDT")
         bot_state["risk_pct"] = float(data.get("risk_pct", 10.0))
-        
         if bot_state["mode"] == "paper":
             init_bal = float(data.get("start_balance", 1000.0))
             bot_state["virtual_balance"] = init_bal
             bot_state["current_balance"] = init_bal
-        
         bot_state["is_running"] = True
-    
-    logger.info(f"▶️ Bot started: {bot_state['mode']} | Balance: ${bot_state['current_balance']}")
+    logger.info(f"▶️ Bot started: {bot_state['mode']}")
     return jsonify({"status": "success", "message": f"Bot started in {bot_state['mode']} mode!"})
 
 @app.route("/api/stop", methods=["POST"])
@@ -748,11 +717,11 @@ def stop_bot():
 
 @app.route("/api/reset_demo", methods=["POST"])
 def reset_demo():
-    data = request.json
+    global active_position
+    data = request.json or {}
     init_bal = float(data.get("start_balance", 1000.0))
-    
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("DELETE FROM trade_history")
         conn.commit()
@@ -762,6 +731,7 @@ def reset_demo():
         logger.error(f"Reset error: {e}")
     
     with state_lock:
+        active_position = None
         bot_state["current_balance"] = init_bal
         bot_state["wins"] = 0
         bot_state["losses"] = 0
@@ -776,7 +746,6 @@ def reset_demo():
 @app.route("/api/status")
 def get_status():
     start_worker_safely()
-    
     with state_lock:
         active_pos_data = None
         available_balance = bot_state["current_balance"]
@@ -792,7 +761,6 @@ def get_status():
                 "sl_price": active_position["sl_price"],
                 "unrealized_pnl": round(unrealized_pnl, 2)
             }
-            
             if bot_state["mode"] == "paper":
                 available_balance = max(0, bot_state["current_balance"] - active_position["total_cost"])
         
@@ -825,10 +793,10 @@ def get_status():
             "ml_confidence": bot_state["ml_confidence"],
             "technical_signal": bot_state["technical_signal"],
             "final_signal": bot_state["final_signal"],
-            "candles": bot_state["candles"][-100:],
-            "ema_20_series": bot_state["ema_20_series"],
-            "ema_50_series": bot_state["ema_50_series"],
-            "ema_200_series": bot_state["ema_200_series"],
+            "candles": bot_state["candles"][-80:],
+            "ema_20_series": bot_state["ema_20_series"][-80:],
+            "ema_50_series": bot_state["ema_50_series"][-80:],
+            "ema_200_series": bot_state["ema_200_series"][-80:],
             "active_trades": bot_state["active_trades"],
             "active_position": active_pos_data
         })
@@ -836,13 +804,12 @@ def get_status():
 @app.route("/api/export_csv")
 def export_csv():
     try:
-        conn = sqlite3.connect(DB_FILE)
+        conn = get_db_connection()
         df = pd.read_sql_query("""
             SELECT timestamp, symbol, side, entry_price, exit_price, layers, 
                    tp, sl, pnl, outcome FROM trade_history ORDER BY id DESC
         """, conn)
         conn.close()
-        
         csv_data = df.to_csv(index=False)
         return csv_data, 200, {
             'Content-Type': 'text/csv',
@@ -852,13 +819,13 @@ def export_csv():
         return str(e), 500
 
 # ============================================
-# ▶️ MAIN
+# ▶️ ENTRY POINT
 # ============================================
-
 if __name__ == "__main__":
     init_db()
     load_db_history()
     logger.info("=" * 60)
-    logger.info("🤖 CRYPTO SPOT DCA TRADING BOT (ACTIVE TRADING)")
+    logger.info("🤖 BULLETPROOF ANTI-FREEZE DCA BOT READY")
     logger.info("=" * 60)
-    app.run(debug=False, port=5000, threaded=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
