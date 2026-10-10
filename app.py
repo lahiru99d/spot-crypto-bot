@@ -13,8 +13,6 @@ import numpy as np
 import requests
 from datetime import datetime
 from flask import Flask, jsonify, request
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import StandardScaler
 from dotenv import load_dotenv
 
 # ============================================
@@ -36,7 +34,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 
 DB_FILE = "bot_memory.db"
-TRADE_COOLDOWN_SECONDS = 15
+TRADE_COOLDOWN_SECONDS = 10  # Reduced to 10s for faster trading
 TIMEFRAME = "3m"
 
 app = Flask(__name__)
@@ -53,7 +51,7 @@ bot_state = {
     "virtual_balance": 1000.0,
     "current_balance": 1000.0,
     "current_price": 0.0,
-    "status_message": "Bot සූදානම්ව පවතී...",
+    "status_message": "Pure Technical Scalper සූදානම්ව පවතී...",
     
     # Trade metrics
     "wins": 0,
@@ -73,9 +71,9 @@ bot_state = {
     "current_atr": 0.0,
     "volatility": 0.0,
     
-    # AI signals
-    "ml_signal": "NEUTRAL",
-    "ml_confidence": 50.0,
+    # UI Compatibility Signals
+    "ml_signal": "ACTIVE",
+    "ml_confidence": 75.0,
     "technical_signal": "NEUTRAL",
     "final_signal": "NEUTRAL",
     
@@ -92,18 +90,11 @@ last_trade_time = 0
 state_lock = threading.Lock()
 worker_thread_started = False
 
-# AI Model Cache in Memory (No repeated fits)
-ml_model = None
-ml_scaler = None
-last_model_train_time = 0
-
 # ============================================
 # 🗄️ SAFE DATABASE HANDLERS
 # ============================================
 def get_db_connection():
-    """Returns sqlite connection with safety timeout"""
-    conn = sqlite3.connect(DB_FILE, timeout=20.0)
-    return conn
+    return sqlite3.connect(DB_FILE, timeout=20.0)
 
 def init_db():
     try:
@@ -130,9 +121,9 @@ def init_db():
         ''')
         conn.commit()
         conn.close()
-        logger.info("✅ Database initialized safely!")
+        logger.info("✅ Database initialized successfully!")
     except Exception as e:
-        logger.error(f"❌ Database init error: {e}")
+        logger.error(f"❌ DB init error: {e}")
 
 def load_db_history():
     try:
@@ -183,7 +174,7 @@ def load_db_history():
         logger.error(f"❌ Load history error: {e}")
 
 def save_trade_to_db(entry_time, exit_time, symbol, side, entry_price, exit_price, 
-                     layers, tp, sl, rsi, macd, ml_conf, pnl, outcome):
+                     layers, tp, sl, rsi, macd, conf, pnl, outcome):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -193,135 +184,76 @@ def save_trade_to_db(entry_time, exit_time, symbol, side, entry_price, exit_pric
              tp, sl, rsi, macd, ml_confidence, pnl, outcome)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (entry_time, exit_time, symbol, side, entry_price, exit_price, layers, 
-              tp, sl, rsi, macd, ml_conf, pnl, outcome))
+              tp, sl, rsi, macd, conf, pnl, outcome))
         conn.commit()
         conn.close()
         load_db_history()
-        logger.info(f"💾 Trade Saved: {outcome} | PnL: ${pnl:.2f}")
+        logger.info(f"💾 Trade Logged: {outcome} | PnL: ${pnl:.2f}")
     except Exception as e:
         logger.error(f"❌ Save trade error: {e}")
 
 # ============================================
-# 🧠 LOW-RAM ML MODEL (NO CONTINUOUS FITTING)
-# ============================================
-FEATURE_COLS = ['rsi', 'price_momentum', 'ema_diff', 'macd_hist', 'volatility', 'atr']
-
-def train_or_update_model(df):
-    """Trains a ultra-lightweight model only once every 4 hours"""
-    global ml_model, ml_scaler, last_model_train_time
-    now = time.time()
-    
-    # Only train if model doesn't exist or 4 hours elapsed
-    if ml_model is not None and (now - last_model_train_time < 14400):
-        return
-
-    try:
-        clean_df = df[FEATURE_COLS + ['target']].dropna().copy()
-        if len(clean_df) < 80:
-            return
-
-        X = clean_df[FEATURE_COLS]
-        y = clean_df['target']
-
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-
-        # Ultra-light model: 30 trees, max depth 4 (takes < 15MB RAM)
-        model = RandomForestClassifier(
-            n_estimators=30,
-            max_depth=4,
-            min_samples_split=8,
-            min_samples_leaf=4,
-            random_state=42,
-            n_jobs=1
-        )
-        model.fit(X_scaled, y)
-
-        ml_model = model
-        ml_scaler = scaler
-        last_model_train_time = now
-        logger.info("🧠 AI Model loaded & cached safely in memory.")
-        
-        # Free memory
-        del clean_df, X, y, X_scaled
-        gc.collect()
-    except Exception as e:
-        logger.error(f"❌ Model training error: {e}")
-
-def predict_ml(df):
-    """Fast prediction using cached model without memory leak"""
-    global ml_model, ml_scaler
-    if ml_model is None or ml_scaler is None:
-        train_or_update_model(df)
-        if ml_model is None:
-            return "NEUTRAL", 50.0
-
-    try:
-        latest = df[FEATURE_COLS].iloc[-1:].values
-        if np.isnan(latest).any():
-            return "NEUTRAL", 50.0
-
-        latest_scaled = ml_scaler.transform(latest)
-        prob_up = ml_model.predict_proba(latest_scaled)[0][1] * 100
-
-        if prob_up >= 52.0:
-            return "LONG", round(prob_up, 1)
-        elif prob_up <= 45.0:
-            return "SHORT", round(100 - prob_up, 1)
-        else:
-            return "NEUTRAL", 50.0
-    except Exception:
-        return "NEUTRAL", 50.0
-
-# ============================================
-# 📊 TECHNICAL STRATEGY
+# 🎯 PURE TECHNICAL FAST SCALPING STRATEGY
 # ============================================
 def get_technical_signal(ind):
+    """
+    Fast Scalping Indicator Engine:
+    Triggered by Pullbacks, Momentum curls & Dip Reversals.
+    """
     price = ind["current_price"]
     ema20 = ind["ema_20"]
     ema50 = ind["ema_50"]
-    macd_bullish = ind["macd"] > ind["macd_signal"]
+    macd = ind["macd"]
+    macd_signal = ind["macd_signal"]
     rsi = ind["rsi"]
 
-    # Short-term momentum check
-    trend_up = (price >= ema20) and (ema20 >= ema50)
-    pullback_bounce = (rsi < 48) and macd_bullish and (price >= ema20 * 0.997)
+    macd_bullish = macd > macd_signal
+    macd_hist = macd - macd_signal
 
-    if trend_up and macd_bullish and (38 <= rsi <= 70):
+    # 1. SETUP A: Dip Pullback Bounce (Highest win rate for Spot)
+    # Price dips but MACD starts curling up, RSI recovering from oversold
+    if (32 <= rsi <= 48) and (macd_bullish or macd_hist > -0.5):
+        return "LONG", 80.0
+
+    # 2. SETUP B: Trend Momentum Scalp
+    # Price is above EMA 20, EMA 20 above EMA 50, MACD positive, healthy RSI
+    if (price >= ema20 * 0.998) and (ema20 >= ema50) and macd_bullish and (45 <= rsi <= 68):
+        return "LONG", 75.0
+
+    # 3. SETUP C: Extreme Oversold Bounce
+    # Quick knife-catch scalp when RSI drops low
+    if rsi < 35:
         return "LONG", 70.0
 
-    if pullback_bounce and (35 <= rsi <= 55):
-        return "LONG", 60.0
-
-    if not macd_bullish and rsi < 38:
+    # Neutral if overbought or dropping hard
+    if rsi > 70 or (not macd_bullish and rsi < 32):
         return "SHORT", 60.0
 
     return "NEUTRAL", 50.0
 
 # ============================================
-# 📊 SAFE BINANCE FETCHER (ANTI-BLOCKING)
+# 📊 BINANCE MARKET DATA
 # ============================================
 def get_klines_and_indicators(symbol):
     try:
-        params = {"symbol": symbol, "interval": TIMEFRAME, "limit": 200}
-        # Connection timeout: 3.5s, Read timeout: 5s
+        params = {"symbol": symbol, "interval": TIMEFRAME, "limit": 180}
         response = requests.get(
             "https://api.binance.com/api/v3/klines",
             params=params,
-            timeout=(3.5, 5.0)
+            timeout=(3.0, 5.0)
         )
         
         if response.status_code == 429:
-            logger.warning("⚠️ Binance Rate limit warning (429)! Cooling down...")
+            logger.warning("⚠️ Binance Rate limit warning! Cooling down 10s...")
             time.sleep(10)
-            return None, None, None
-
+            return None, None
+        
         if response.status_code != 200:
-            return None, None, None
+            return None, None
         
         data = response.json()
-        if not data or len(data) < 100:
-            return None, None, None
+        if not data or len(data) < 80:
+            return None, None
         
         df = pd.DataFrame(data, columns=[
             'time', 'open', 'high', 'low', 'close', 'volume',
@@ -336,7 +268,7 @@ def get_klines_and_indicators(symbol):
         high = df['high']
         low = df['low']
         
-        # Fast indicator computation
+        # Technicals
         df['ema_20'] = close.ewm(span=20, adjust=False).mean()
         df['ema_50'] = close.ewm(span=50, adjust=False).mean()
         df['ema_200'] = close.ewm(span=200, adjust=False).mean()
@@ -359,19 +291,13 @@ def get_klines_and_indicators(symbol):
         ], axis=1).max(axis=1)
         df['atr'] = tr.rolling(window=14).mean()
         df['volatility'] = close.pct_change().rolling(window=15).std() * 100
-        
-        # Features for AI
-        df['price_momentum'] = (close - close.shift(4)) / close.shift(4) * 100
-        df['ema_diff'] = (df['ema_20'] - df['ema_50']) / close * 100
-        df['macd_hist'] = df['macd'] - df['macd_signal']
-        df['target'] = (close.shift(-1) > close).astype(int)
 
-        # Build lightweight candle slice for chart
+        # Lightweight candles for UI
         chart_candles = []
         ema_20_list, ema_50_list, ema_200_list = [], [], []
-        tail_df = df.tail(80)  # Keep payload small
+        tail_df = df.tail(80)
 
-        for idx, row in tail_df.iterrows():
+        for _, row in tail_df.iterrows():
             t = int(row['time'])
             chart_candles.append({
                 "time": t,
@@ -402,13 +328,13 @@ def get_klines_and_indicators(symbol):
             "ema_200_series": ema_200_list
         }
         
-        return chart_candles, indicators, df
+        return chart_candles, indicators
     except requests.exceptions.RequestException as e:
-        logger.warning(f"⚠️ Network timeout/error: {e}")
-        return None, None, None
+        logger.warning(f"⚠️ Network error: {e}")
+        return None, None
     except Exception as e:
-        logger.error(f"❌ Indicator parse error: {e}")
-        return None, None, None
+        logger.error(f"❌ Indicator calculation error: {e}")
+        return None, None
 
 # ============================================
 # 💹 POSITION MANAGEMENT
@@ -420,14 +346,15 @@ def calculate_dca_levels(layers):
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
+    # Quick Scalp TP targets
     if len(layers) == 1:
-        tp_ratio = 1.020  # +2.0%
-        sl_ratio = 0.980  # -2.0%
+        tp_ratio = 1.015  # +1.5% Take Profit (Fast flip)
+        sl_ratio = 0.980  # -2.0% Stop Loss
     elif len(layers) == 2:
-        tp_ratio = 1.015  # +1.5%
+        tp_ratio = 1.012  # +1.2% (Quick average-out)
         sl_ratio = 0.975  # -2.5%
     else:
-        tp_ratio = 1.012
+        tp_ratio = 1.010  # +1.0%
         sl_ratio = 0.970
 
     return (round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), 
@@ -474,24 +401,18 @@ def place_market_order(symbol, side, quote_qty, mode):
 def process_bot_logic(symbol, mode, risk_pct):
     global active_position, last_trade_time
     
-    candles, ind, df = get_klines_and_indicators(symbol)
-    if not ind or df is None:
+    candles, ind = get_klines_and_indicators(symbol)
+    if not ind or candles is None:
         return
     
     current_time = time.time()
     current_price = ind["current_price"]
     
-    # Train model safely in background if needed
-    train_or_update_model(df)
-    
-    ml_signal, ml_conf = predict_ml(df)
+    # Pure technical signal evaluation (Microseconds)
     tech_signal, tech_conf = get_technical_signal(ind)
+    final_signal = tech_signal
     
-    final_signal = "NEUTRAL"
-    if tech_signal == "LONG" and (ml_signal == "LONG" or ml_conf >= 50.0):
-        final_signal = "LONG"
-    
-    # Update state for dashboard
+    # State update for UI
     with state_lock:
         bot_state["current_price"] = current_price
         bot_state["candles"] = candles
@@ -506,8 +427,8 @@ def process_bot_logic(symbol, mode, risk_pct):
         bot_state["current_macd_signal"] = ind["macd_signal"]
         bot_state["current_atr"] = ind["atr"]
         bot_state["volatility"] = ind["volatility"]
-        bot_state["ml_signal"] = ml_signal
-        bot_state["ml_confidence"] = ml_conf
+        bot_state["ml_signal"] = final_signal
+        bot_state["ml_confidence"] = tech_conf
         bot_state["technical_signal"] = tech_signal
         bot_state["final_signal"] = final_signal
 
@@ -524,9 +445,9 @@ def process_bot_logic(symbol, mode, risk_pct):
         
         unrealized_pnl = (current_price - avg_price) * total_qty
         
-        # Check DCA Layer buy
-        if len(layers) < 3 and current_price <= active_position["last_layer_price"] * 0.985:
-            if ind["rsi"] < 45:
+        # DCA Layer Add: Drops by 1.4% and RSI confirms dip
+        if len(layers) < 3 and current_price <= active_position["last_layer_price"] * 0.986:
+            if ind["rsi"] < 48:
                 with state_lock:
                     balance = bot_state["current_balance"]
                 
@@ -551,7 +472,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                     })
                     logger.info(f"📈 DCA Layer {len(layers)} Executed @ ${current_price}")
         
-        # Check Exit conditions
+        # Exit checks
         exit_reason = None
         if current_price >= tp_price:
             exit_reason = "TP_HIT"
@@ -571,7 +492,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                     active_position["entry_time"],
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     symbol, "LONG", avg_price, exit_price, len(layers),
-                    tp_price, sl_price, ind["rsi"], ind["macd"], ml_conf,
+                    tp_price, sl_price, ind["rsi"], ind["macd"], tech_conf,
                     net_pnl, outcome
                 )
                 
@@ -590,7 +511,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 
                 active_position = None
                 last_trade_time = current_time
-                logger.info(f"🎯 Position Closed: {outcome} | PnL: ${net_pnl:.2f}")
+                logger.info(f"🎯 Trade Closed: {outcome} | PnL: ${net_pnl:.2f}")
         else:
             with state_lock:
                 bot_state["status_message"] = (
@@ -598,7 +519,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                     f"TP: ${tp_price} | SL: ${sl_price} | PnL: ${unrealized_pnl:.2f}"
                 )
 
-    # ===== LOOK FOR ENTRY =====
+    # ===== LOOK FOR INSTANT SCALPING ENTRY =====
     else:
         cooldown = TRADE_COOLDOWN_SECONDS
         if (current_time - last_trade_time) < cooldown:
@@ -606,9 +527,10 @@ def process_bot_logic(symbol, mode, risk_pct):
                 bot_state["status_message"] = f"Cooldown: {int(cooldown - (current_time - last_trade_time))}s"
         else:
             with state_lock:
-                bot_state["status_message"] = f"Scanning... | Tech: {tech_signal} ({tech_conf:.0f}%) | AI: {ml_signal} ({ml_conf:.0f}%)"
-            
-            if final_signal == "LONG" and tech_conf >= 60 and ml_conf >= 50:
+                bot_state["status_message"] = f"Scanning... | Signal: {tech_signal} ({tech_conf:.0f}%) | RSI: {ind['rsi']}"
+
+            # Instant trigger on technical setup (No AI barrier!)
+            if final_signal == "LONG" and tech_conf >= 65:
                 with state_lock:
                     balance = bot_state["current_balance"]
                 
@@ -636,17 +558,16 @@ def process_bot_logic(symbol, mode, risk_pct):
                             "tp_price": tp_p,
                             "sl_price": sl_p,
                             "last_layer_price": current_price,
-                            "ml_signal": ml_signal,
-                            "ml_conf": ml_conf
+                            "ml_signal": final_signal,
+                            "ml_conf": tech_conf
                         }
-                        logger.info(f"🚀 New Position opened @ ${current_price}")
+                        logger.info(f"🚀 SCALP ENTRY OPENED @ ${current_price} | TP: ${tp_p}")
 
 # ============================================
-# 🔄 BULLETPROOF WORKER LOOP (NO CRASHES)
+# 🔄 WORKER THREAD
 # ============================================
 def bot_worker():
-    """Persistent, self-healing background worker"""
-    logger.info("🚀 Background Trading Worker Started Successfully!")
+    logger.info("🚀 Pure Technical Scalper Worker Started!")
     loop_count = 0
     while True:
         try:
@@ -660,16 +581,15 @@ def bot_worker():
                 process_bot_logic(symbol, mode, risk_pct)
             
             loop_count += 1
-            # Clean RAM every 20 loops (prevents Render 512MB RAM leaks)
-            if loop_count % 20 == 0:
+            if loop_count % 30 == 0:
                 gc.collect()
 
         except Exception as e:
-            logger.error(f"⚠️ Recovered from worker loop error: {e}")
+            logger.error(f"⚠️ Worker loop caught error: {e}")
             logger.error(traceback.format_exc())
             time.sleep(5)
         
-        time.sleep(6)  # Safe 6s delay (Prevents Binance 429 block)
+        time.sleep(5)  # 5-second responsive check
 
 def start_worker_safely():
     global worker_thread_started
@@ -705,14 +625,14 @@ def start_bot():
             bot_state["virtual_balance"] = init_bal
             bot_state["current_balance"] = init_bal
         bot_state["is_running"] = True
-    logger.info(f"▶️ Bot started: {bot_state['mode']}")
+    logger.info(f"▶️ Bot Started: {bot_state['mode']}")
     return jsonify({"status": "success", "message": f"Bot started in {bot_state['mode']} mode!"})
 
 @app.route("/api/stop", methods=["POST"])
 def stop_bot():
     with state_lock:
         bot_state["is_running"] = False
-    logger.info("⏹️ Bot stopped")
+    logger.info("⏹️ Bot Stopped")
     return jsonify({"status": "success", "message": "Bot stopped"})
 
 @app.route("/api/reset_demo", methods=["POST"])
@@ -726,7 +646,7 @@ def reset_demo():
         cursor.execute("DELETE FROM trade_history")
         conn.commit()
         conn.close()
-        logger.info("🗑️ Trade history cleared")
+        logger.info("🗑️ Demo trade history cleared")
     except Exception as e:
         logger.error(f"Reset error: {e}")
     
@@ -825,7 +745,7 @@ if __name__ == "__main__":
     init_db()
     load_db_history()
     logger.info("=" * 60)
-    logger.info("🤖 BULLETPROOF ANTI-FREEZE DCA BOT READY")
+    logger.info("🤖 PURE TECHNICAL SPOT DCA SCALPER READY")
     logger.info("=" * 60)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
