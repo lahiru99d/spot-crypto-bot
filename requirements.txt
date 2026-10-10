@@ -1,6 +1,6 @@
-Flask
+flask
+gunicorn
+requests
 pandas
 numpy
-requests
-scikit-learn
-gunicorn
+python-dotenv
