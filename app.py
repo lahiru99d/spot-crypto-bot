@@ -14,7 +14,7 @@ import requests
 from datetime import datetime
 from flask import Flask, jsonify, request
 
-# Safe dotenv import (Never crashes deploy even if missing)
+# Safe dotenv import
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -48,14 +48,17 @@ app = Flask(__name__)
 # ============================================
 bot_state = {
     "is_running": False,
-    "mode": "paper",
+    "mode": "PAPER",
+    "trading_mode": "PAPER",
     "symbol": "ETHUSDT",
     "leverage": 1,
     "risk_pct": 10.0,
+    "max_layers": 3,
+    "total_layers": 3,
     "virtual_balance": 1000.0,
     "current_balance": 1000.0,
     "current_price": 0.0,
-    "status_message": "Pure Technical Scalper සූදානම්ව පවතී...",
+    "status_message": "Fast Scalper Bot සූදානම්ව පවතී...",
     
     # Trade metrics
     "wins": 0,
@@ -75,7 +78,7 @@ bot_state = {
     "current_atr": 0.0,
     "volatility": 0.0,
     
-    # UI Compatibility Signals
+    # Signals
     "ml_signal": "ACTIVE",
     "ml_confidence": 75.0,
     "technical_signal": "NEUTRAL",
@@ -197,7 +200,7 @@ def save_trade_to_db(entry_time, exit_time, symbol, side, entry_price, exit_pric
         logger.error(f"❌ Save trade error: {e}")
 
 # ============================================
-# 🎯 PURE TECHNICAL FAST SCALPING STRATEGY
+# 🎯 QUICK SCALPING INDICATOR ENGINE
 # ============================================
 def get_technical_signal(ind):
     price = ind["current_price"]
@@ -210,35 +213,32 @@ def get_technical_signal(ind):
     macd_bullish = macd > macd_signal
     macd_hist = macd - macd_signal
 
-    # 1. SETUP A: Dip Pullback Bounce (Quick Reversal)
+    # Dip bounce
     if (32 <= rsi <= 48) and (macd_bullish or macd_hist > -0.5):
         return "LONG", 80.0
 
-    # 2. SETUP B: Trend Momentum Scalp
+    # Trend scalp
     if (price >= ema20 * 0.998) and (ema20 >= ema50) and macd_bullish and (45 <= rsi <= 68):
         return "LONG", 75.0
 
-    # 3. SETUP C: Oversold Rebound
+    # Oversold bounce
     if rsi < 35:
         return "LONG", 70.0
 
-    # Neutral / Drop check
     if rsi > 70 or (not macd_bullish and rsi < 32):
         return "SHORT", 60.0
 
     return "NEUTRAL", 50.0
 
 # ============================================
-# 📊 SAFE BINANCE MULTI-ENDPOINT FETCHER
+# 📊 BINANCE MARKET DATA
 # ============================================
 def get_klines_and_indicators(symbol):
-    # Backup endpoints prevent US/Datacenter IP blocks
     endpoints = [
         "https://api1.binance.com/api/v3/klines",
         "https://api.binance.com/api/v3/klines",
         "https://data-api.binance.vision/api/v3/klines"
     ]
-    
     data = None
     params = {"symbol": symbol, "interval": TIMEFRAME, "limit": 180}
     
@@ -271,7 +271,6 @@ def get_klines_and_indicators(symbol):
         high = df['high']
         low = df['low']
         
-        # Technicals
         df['ema_20'] = close.ewm(span=20, adjust=False).mean()
         df['ema_50'] = close.ewm(span=50, adjust=False).mean()
         df['ema_200'] = close.ewm(span=200, adjust=False).mean()
@@ -295,7 +294,6 @@ def get_klines_and_indicators(symbol):
         df['atr'] = tr.rolling(window=14).mean()
         df['volatility'] = close.pct_change().rolling(window=15).std() * 100
 
-        # Small payload for chart
         chart_candles = []
         ema_20_list, ema_50_list, ema_200_list = [], [], []
         tail_df = df.tail(80)
@@ -336,7 +334,7 @@ def get_klines_and_indicators(symbol):
         return None, None
 
 # ============================================
-# 💹 POSITION MANAGEMENT
+# 💹 FAST SCALP DCA & TAKE PROFIT
 # ============================================
 def calculate_dca_levels(layers):
     if not layers:
@@ -345,21 +343,22 @@ def calculate_dca_levels(layers):
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
+    # 🟢 QUICK SCALPING TARGETS (+0.6% fast exit)
     if len(layers) == 1:
-        tp_ratio = 1.015  # +1.5% Quick Scalp TP
-        sl_ratio = 0.980  # -2.0% SL
+        tp_ratio = 1.006  # +0.6% Take Profit (Very fast exit!)
+        sl_ratio = 0.982  # -1.8% Stop Loss
     elif len(layers) == 2:
-        tp_ratio = 1.012  # +1.2%
-        sl_ratio = 0.975  # -2.5%
+        tp_ratio = 1.004  # +0.4% Average out
+        sl_ratio = 0.978  # -2.2%
     else:
-        tp_ratio = 1.010
-        sl_ratio = 0.970
+        tp_ratio = 1.003  # +0.3% Recovery
+        sl_ratio = 0.975  # -2.5%
 
     return (round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), 
             round(avg_price * tp_ratio, 4), round(avg_price * sl_ratio, 4))
 
 def place_market_order(symbol, side, quote_qty, mode):
-    if mode == "paper":
+    if mode.upper() == "PAPER":
         return {"orderId": "PAPER_" + str(int(time.time())), "status": "FILLED"}
     
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
@@ -409,7 +408,7 @@ def process_bot_logic(symbol, mode, risk_pct):
     tech_signal, tech_conf = get_technical_signal(ind)
     final_signal = tech_signal
     
-    # State update for UI
+    # State update
     with state_lock:
         bot_state["current_price"] = current_price
         bot_state["candles"] = candles
@@ -441,9 +440,17 @@ def process_bot_logic(symbol, mode, risk_pct):
         sl_price = active_position["sl_price"]
         
         unrealized_pnl = (current_price - avg_price) * total_qty
+        unrealized_pnl_pct = (unrealized_pnl / active_position["total_cost"]) * 100
         
-        # DCA Layer Add: Drop by 1.4% and safe dip RSI
-        if len(layers) < 3 and current_price <= active_position["last_layer_price"] * 0.986:
+        # Calculate how long trade has been open (in minutes)
+        try:
+            entry_dt = datetime.strptime(active_position["entry_time"], "%Y-%m-%d %H:%M:%S")
+            trade_duration_minutes = (datetime.now() - entry_dt).total_seconds() / 60.0
+        except Exception:
+            trade_duration_minutes = 0
+
+        # DCA Layer Add: Drop by 1.2%
+        if len(layers) < 3 and current_price <= active_position["last_layer_price"] * 0.988:
             if ind["rsi"] < 48:
                 with state_lock:
                     balance = bot_state["current_balance"]
@@ -452,7 +459,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 next_layer_qty = round(next_layer_usd / current_price, 4)
                 
                 order = place_market_order(symbol, "BUY", next_layer_usd, mode)
-                if order and ("orderId" in order or mode == "paper"):
+                if order and ("orderId" in order or mode.upper() == "PAPER"):
                     layers.append({
                         "layer": len(layers) + 1,
                         "price": current_price,
@@ -468,14 +475,23 @@ def process_bot_logic(symbol, mode, risk_pct):
                         "last_layer_price": current_price
                     })
                     logger.info(f"📈 DCA Layer {len(layers)} Executed @ ${current_price}")
-        
-        # Exit checks
+
+        # ===== EXIT LOGIC (NO MORE STUCK TRADES) =====
         exit_reason = None
+        
+        # 1. Main Scalp Take Profit Hit (+0.6%)
         if current_price >= tp_price:
-            exit_reason = "TP_HIT"
+            exit_reason = "SCALP_TP_HIT"
+        # 2. Stop Loss Hit
         elif current_price <= sl_price:
             exit_reason = "SL_HIT"
-        
+        # 3. Overbought exit: Price has good profit (+0.3%) & RSI > 65 (Reversal risk)
+        elif unrealized_pnl_pct >= 0.3 and ind["rsi"] >= 65:
+            exit_reason = "MOMENTUM_EXIT"
+        # 4. Stale trade auto-exit: Open > 45 mins & has slight profit (+0.15%+)
+        elif trade_duration_minutes >= 45 and unrealized_pnl_pct >= 0.15:
+            exit_reason = "STALE_PROFIT_EXIT"
+
         if exit_reason:
             exit_price = current_price
             gross_pnl = (exit_price - avg_price) * total_qty
@@ -484,7 +500,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             outcome = f"{exit_reason} | {'WIN ✅' if net_pnl > 0 else 'LOSS ❌'}"
             
             order = place_market_order(symbol, "SELL", total_qty * exit_price, mode)
-            if order or mode == "paper":
+            if order or mode.upper() == "PAPER":
                 save_trade_to_db(
                     active_position["entry_time"],
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -503,17 +519,17 @@ def process_bot_logic(symbol, mode, risk_pct):
                     
                     bot_state["total_trades"] += 1
                     bot_state["current_profit"] += net_pnl
-                    if mode == "paper":
+                    if mode.upper() == "PAPER":
                         bot_state["current_balance"] += net_pnl
                 
                 active_position = None
                 last_trade_time = current_time
-                logger.info(f"🎯 Trade Closed: {outcome} | PnL: ${net_pnl:.2f}")
+                logger.info(f"🎯 Scalp Trade Closed: {outcome} | PnL: ${net_pnl:.2f}")
         else:
             with state_lock:
                 bot_state["status_message"] = (
-                    f"SPOT DCA (LONG {len(layers)}/3) | Avg: ${avg_price} | "
-                    f"TP: ${tp_price} | SL: ${sl_price} | PnL: ${unrealized_pnl:.2f}"
+                    f"SCALP ({len(layers)}/3) | Avg: ${avg_price} | "
+                    f"TP: ${tp_price} (+0.6%) | SL: ${sl_price} | PnL: ${unrealized_pnl:.2f}"
                 )
 
     # ===== LOOK FOR SCALPING ENTRY =====
@@ -526,7 +542,6 @@ def process_bot_logic(symbol, mode, risk_pct):
             with state_lock:
                 bot_state["status_message"] = f"Scanning... | Signal: {tech_signal} ({tech_conf:.0f}%) | RSI: {ind['rsi']}"
 
-            # Instant trigger on setup
             if final_signal == "LONG" and tech_conf >= 65:
                 with state_lock:
                     balance = bot_state["current_balance"]
@@ -536,7 +551,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 
                 if entry_qty > 0 and balance >= 10:
                     order = place_market_order(symbol, "BUY", entry_usd, mode)
-                    if order and ("orderId" in order or mode == "paper"):
+                    if order and ("orderId" in order or mode.upper() == "PAPER"):
                         entry_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         layers = [{
                             "layer": 1,
@@ -549,6 +564,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                         active_position = {
                             "entry_time": entry_time,
                             "layers": layers,
+                            "max_layers": 3,
                             "avg_price": avg_p,
                             "total_qty": tot_q,
                             "total_cost": tot_c,
@@ -564,7 +580,7 @@ def process_bot_logic(symbol, mode, risk_pct):
 # 🔄 WORKER THREAD
 # ============================================
 def bot_worker():
-    logger.info("🚀 Pure Technical Scalper Worker Started!")
+    logger.info("🚀 Scalper Worker Started!")
     loop_count = 0
     while True:
         try:
@@ -591,13 +607,11 @@ def bot_worker():
 def start_worker_safely():
     global worker_thread
     with state_lock:
-        # Auto-Revive if thread was never started or died
         if worker_thread is None or not worker_thread.is_alive():
             worker_thread = threading.Thread(target=bot_worker, daemon=True)
             worker_thread.start()
             logger.info("🚀 Background Worker Thread (Re)started Successfully!")
 
-# Initialize Database on Gunicorn load
 init_db()
 load_db_history()
 
@@ -618,15 +632,17 @@ def start_bot():
     start_worker_safely()
     data = request.json or {}
     with state_lock:
-        bot_state["mode"] = data.get("mode", "paper")
+        mode_val = data.get("mode", "PAPER").upper()
+        bot_state["mode"] = mode_val
+        bot_state["trading_mode"] = mode_val
         bot_state["symbol"] = data.get("symbol", "ETHUSDT")
         bot_state["risk_pct"] = float(data.get("risk_pct", 10.0))
-        if bot_state["mode"] == "paper":
+        if mode_val == "PAPER":
             init_bal = float(data.get("start_balance", 1000.0))
             bot_state["virtual_balance"] = init_bal
             bot_state["current_balance"] = init_bal
         bot_state["is_running"] = True
-    logger.info(f"▶️ Bot Started: {bot_state['mode']}")
+    logger.info(f"▶️ Bot Started in {bot_state['mode']} mode")
     return jsonify({"status": "success", "message": f"Bot started in {bot_state['mode']} mode!"})
 
 @app.route("/api/stop", methods=["POST"])
@@ -676,13 +692,15 @@ def get_status():
             active_pos_data = {
                 "entry_time": active_position["entry_time"],
                 "layers": active_position["layers"],
+                "max_layers": 3,
+                "total_layers": 3,
                 "avg_price": active_position["avg_price"],
                 "total_qty": active_position["total_qty"],
                 "tp_price": active_position["tp_price"],
                 "sl_price": active_position["sl_price"],
                 "unrealized_pnl": round(unrealized_pnl, 2)
             }
-            if bot_state["mode"] == "paper":
+            if bot_state["mode"] == "PAPER":
                 available_balance = max(0, bot_state["current_balance"] - active_position["total_cost"])
         
         win_rate = 0
@@ -692,8 +710,11 @@ def get_status():
         return jsonify({
             "is_running": bot_state["is_running"],
             "mode": bot_state["mode"],
+            "trading_mode": bot_state["trading_mode"],
             "symbol": bot_state["symbol"],
             "risk_pct": bot_state["risk_pct"],
+            "max_layers": 3,
+            "total_layers": 3,
             "balance": round(available_balance, 2),
             "current_profit": round(bot_state["current_profit"], 2),
             "total_trades": bot_state["total_trades"],
