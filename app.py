@@ -50,7 +50,10 @@ bot_state = {
     "mode": "paper",
     "trading_mode": "paper",
     "trade_mode": "paper",
+    "tradingMode": "PAPER",
+    "tradeMode": "PAPER",
     "mode_type": "PAPER",
+    "mode_name": "PAPER",
     "symbol": "ETHUSDT",
     "leverage": 1,
     "risk_pct": 10.0,
@@ -232,14 +235,17 @@ def get_technical_signal(ind):
     return "NEUTRAL", 50.0
 
 # ============================================
-# 📊 SAFE BINANCE FETCHER (WITH USER-AGENT)
+# 📊 SAFE BINANCE FETCHER (GEO-RESTRICTION FIX)
 # ============================================
 def get_klines_and_indicators(symbol):
-    # Public non-restricted data endpoints
+    # api.binance.us comes FIRST so Render (US server) never gets blocked!
     endpoints = [
-        "https://data-api.binance.vision/api/v3/klines",
+        "https://api.binance.us/api/v3/klines",
         "https://api.binance.com/api/v3/klines",
-        "https://api1.binance.com/api/v3/klines"
+        "https://api1.binance.com/api/v3/klines",
+        "https://api2.binance.com/api/v3/klines",
+        "https://api3.binance.com/api/v3/klines",
+        "https://data-api.binance.vision/api/v3/klines"
     ]
     
     headers = {
@@ -251,13 +257,15 @@ def get_klines_and_indicators(symbol):
     
     for url in endpoints:
         try:
-            res = requests.get(url, params=params, headers=headers, timeout=5)
+            res = requests.get(url, params=params, headers=headers, timeout=4)
             if res.status_code == 200:
                 raw = res.json()
                 if isinstance(raw, list) and len(raw) >= 50:
                     data = raw
                     break
-        except Exception as e:
+            else:
+                logger.warning(f"⚠️ {url} returned status {res.status_code}")
+        except Exception:
             continue
 
     if not data or len(data) < 50:
@@ -435,7 +443,6 @@ def process_bot_logic(symbol, mode, risk_pct):
         bot_state["technical_signal"] = tech_signal
         bot_state["final_signal"] = final_signal
 
-    # Stop here if user hasn't clicked Bot Start
     if not bot_state["is_running"]:
         with state_lock:
             bot_state["status_message"] = f"Live Market සම්බන්ධයි (${current_price}) | Bot Start කිරීමට සූදානම්..."
@@ -593,7 +600,6 @@ def bot_worker():
                 mode = bot_state["mode"]
                 risk_pct = bot_state["risk_pct"]
             
-            # Always fetch data so chart & indicators are live!
             process_bot_logic(symbol, mode, risk_pct)
             
             loop_count += 1
@@ -639,7 +645,10 @@ def start_bot():
         bot_state["mode"] = mode_val
         bot_state["trading_mode"] = mode_val
         bot_state["trade_mode"] = mode_val
+        bot_state["tradingMode"] = mode_val.upper()
+        bot_state["tradeMode"] = mode_val.upper()
         bot_state["mode_type"] = mode_val.upper()
+        bot_state["mode_name"] = mode_val.upper()
         bot_state["symbol"] = data.get("symbol", "ETHUSDT")
         bot_state["risk_pct"] = float(data.get("risk_pct", 10.0))
         if mode_val == "paper":
@@ -717,7 +726,10 @@ def get_status():
             "mode": bot_state["mode"],
             "trading_mode": bot_state["trading_mode"],
             "trade_mode": bot_state["trade_mode"],
+            "tradingMode": bot_state["tradingMode"],
+            "tradeMode": bot_state["tradeMode"],
             "mode_type": bot_state["mode_type"],
+            "mode_name": bot_state["mode_name"],
             "symbol": bot_state["symbol"],
             "risk_pct": bot_state["risk_pct"],
             "max_layers": 3,
