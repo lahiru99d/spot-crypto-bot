@@ -14,7 +14,6 @@ import requests
 from datetime import datetime
 from flask import Flask, jsonify, request
 
-# Safe dotenv import
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -48,8 +47,10 @@ app = Flask(__name__)
 # ============================================
 bot_state = {
     "is_running": False,
-    "mode": "PAPER",
-    "trading_mode": "PAPER",
+    "mode": "paper",
+    "trading_mode": "paper",
+    "trade_mode": "paper",
+    "mode_type": "PAPER",
     "symbol": "ETHUSDT",
     "leverage": 1,
     "risk_pct": 10.0,
@@ -58,7 +59,7 @@ bot_state = {
     "virtual_balance": 1000.0,
     "current_balance": 1000.0,
     "current_price": 0.0,
-    "status_message": "Fast Scalper Bot සූදානම්ව පවතී...",
+    "status_message": "Market Data සම්බන්ධ වෙමින් පවතී...",
     
     # Trade metrics
     "wins": 0,
@@ -213,15 +214,15 @@ def get_technical_signal(ind):
     macd_bullish = macd > macd_signal
     macd_hist = macd - macd_signal
 
-    # Dip bounce
-    if (32 <= rsi <= 48) and (macd_bullish or macd_hist > -0.5):
+    # 1. Dip bounce (oversold recovery)
+    if (32 <= rsi <= 50) and (macd_bullish or macd_hist > -0.4):
         return "LONG", 80.0
 
-    # Trend scalp
+    # 2. Trend momentum
     if (price >= ema20 * 0.998) and (ema20 >= ema50) and macd_bullish and (45 <= rsi <= 68):
         return "LONG", 75.0
 
-    # Oversold bounce
+    # 3. Oversold bounce
     if rsi < 35:
         return "LONG", 70.0
 
@@ -231,30 +232,35 @@ def get_technical_signal(ind):
     return "NEUTRAL", 50.0
 
 # ============================================
-# 📊 BINANCE MARKET DATA
+# 📊 SAFE BINANCE FETCHER (WITH USER-AGENT)
 # ============================================
 def get_klines_and_indicators(symbol):
+    # Public non-restricted data endpoints
     endpoints = [
-        "https://api1.binance.com/api/v3/klines",
+        "https://data-api.binance.vision/api/v3/klines",
         "https://api.binance.com/api/v3/klines",
-        "https://data-api.binance.vision/api/v3/klines"
+        "https://api1.binance.com/api/v3/klines"
     ]
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
     data = None
-    params = {"symbol": symbol, "interval": TIMEFRAME, "limit": 180}
+    params = {"symbol": symbol, "interval": TIMEFRAME, "limit": 150}
     
     for url in endpoints:
         try:
-            res = requests.get(url, params=params, timeout=(3.0, 5.0))
+            res = requests.get(url, params=params, headers=headers, timeout=5)
             if res.status_code == 200:
-                data = res.json()
-                if data and len(data) >= 80:
+                raw = res.json()
+                if isinstance(raw, list) and len(raw) >= 50:
+                    data = raw
                     break
-            elif res.status_code == 429:
-                time.sleep(5)
-        except Exception:
+        except Exception as e:
             continue
 
-    if not data or len(data) < 80:
+    if not data or len(data) < 50:
         return None, None
 
     try:
@@ -263,7 +269,7 @@ def get_klines_and_indicators(symbol):
             'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
         ])
         
-        df['time'] = (df['time'].astype(int) / 1000).astype(int)
+        df['time'] = (df['time'].astype(np.int64) / 1000).astype(int)
         for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = df[col].astype(float)
         
@@ -343,22 +349,21 @@ def calculate_dca_levels(layers):
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
-    # 🟢 QUICK SCALPING TARGETS (+0.6% fast exit)
     if len(layers) == 1:
-        tp_ratio = 1.006  # +0.6% Take Profit (Very fast exit!)
-        sl_ratio = 0.982  # -1.8% Stop Loss
+        tp_ratio = 1.006  # +0.6% Fast scalp TP
+        sl_ratio = 0.982  # -1.8% SL
     elif len(layers) == 2:
         tp_ratio = 1.004  # +0.4% Average out
         sl_ratio = 0.978  # -2.2%
     else:
-        tp_ratio = 1.003  # +0.3% Recovery
+        tp_ratio = 1.003  # +0.3%
         sl_ratio = 0.975  # -2.5%
 
     return (round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), 
             round(avg_price * tp_ratio, 4), round(avg_price * sl_ratio, 4))
 
 def place_market_order(symbol, side, quote_qty, mode):
-    if mode.upper() == "PAPER":
+    if mode.lower() == "paper":
         return {"orderId": "PAPER_" + str(int(time.time())), "status": "FILLED"}
     
     if not BINANCE_API_KEY or not BINANCE_API_SECRET:
@@ -400,6 +405,8 @@ def process_bot_logic(symbol, mode, risk_pct):
     
     candles, ind = get_klines_and_indicators(symbol)
     if not ind or candles is None:
+        with state_lock:
+            bot_state["status_message"] = "⚠️ Binance Data සම්බන්ධතාව පරීක්ෂා කරමින්..."
         return
     
     current_time = time.time()
@@ -408,7 +415,7 @@ def process_bot_logic(symbol, mode, risk_pct):
     tech_signal, tech_conf = get_technical_signal(ind)
     final_signal = tech_signal
     
-    # State update
+    # Live data update for UI
     with state_lock:
         bot_state["current_price"] = current_price
         bot_state["candles"] = candles
@@ -428,7 +435,10 @@ def process_bot_logic(symbol, mode, risk_pct):
         bot_state["technical_signal"] = tech_signal
         bot_state["final_signal"] = final_signal
 
+    # Stop here if user hasn't clicked Bot Start
     if not bot_state["is_running"]:
+        with state_lock:
+            bot_state["status_message"] = f"Live Market සම්බන්ධයි (${current_price}) | Bot Start කිරීමට සූදානම්..."
         return
 
     # ===== MANAGE ACTIVE TRADE =====
@@ -442,14 +452,13 @@ def process_bot_logic(symbol, mode, risk_pct):
         unrealized_pnl = (current_price - avg_price) * total_qty
         unrealized_pnl_pct = (unrealized_pnl / active_position["total_cost"]) * 100
         
-        # Calculate how long trade has been open (in minutes)
         try:
             entry_dt = datetime.strptime(active_position["entry_time"], "%Y-%m-%d %H:%M:%S")
             trade_duration_minutes = (datetime.now() - entry_dt).total_seconds() / 60.0
         except Exception:
             trade_duration_minutes = 0
 
-        # DCA Layer Add: Drop by 1.2%
+        # DCA Layer Add
         if len(layers) < 3 and current_price <= active_position["last_layer_price"] * 0.988:
             if ind["rsi"] < 48:
                 with state_lock:
@@ -459,7 +468,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 next_layer_qty = round(next_layer_usd / current_price, 4)
                 
                 order = place_market_order(symbol, "BUY", next_layer_usd, mode)
-                if order and ("orderId" in order or mode.upper() == "PAPER"):
+                if order and ("orderId" in order or mode.lower() == "paper"):
                     layers.append({
                         "layer": len(layers) + 1,
                         "price": current_price,
@@ -476,19 +485,14 @@ def process_bot_logic(symbol, mode, risk_pct):
                     })
                     logger.info(f"📈 DCA Layer {len(layers)} Executed @ ${current_price}")
 
-        # ===== EXIT LOGIC (NO MORE STUCK TRADES) =====
+        # Exit Checks
         exit_reason = None
-        
-        # 1. Main Scalp Take Profit Hit (+0.6%)
         if current_price >= tp_price:
-            exit_reason = "SCALP_TP_HIT"
-        # 2. Stop Loss Hit
+            exit_reason = "SCALP_TP_HIT (+0.6%)"
         elif current_price <= sl_price:
             exit_reason = "SL_HIT"
-        # 3. Overbought exit: Price has good profit (+0.3%) & RSI > 65 (Reversal risk)
         elif unrealized_pnl_pct >= 0.3 and ind["rsi"] >= 65:
             exit_reason = "MOMENTUM_EXIT"
-        # 4. Stale trade auto-exit: Open > 45 mins & has slight profit (+0.15%+)
         elif trade_duration_minutes >= 45 and unrealized_pnl_pct >= 0.15:
             exit_reason = "STALE_PROFIT_EXIT"
 
@@ -500,7 +504,7 @@ def process_bot_logic(symbol, mode, risk_pct):
             outcome = f"{exit_reason} | {'WIN ✅' if net_pnl > 0 else 'LOSS ❌'}"
             
             order = place_market_order(symbol, "SELL", total_qty * exit_price, mode)
-            if order or mode.upper() == "PAPER":
+            if order or mode.lower() == "paper":
                 save_trade_to_db(
                     active_position["entry_time"],
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -519,12 +523,12 @@ def process_bot_logic(symbol, mode, risk_pct):
                     
                     bot_state["total_trades"] += 1
                     bot_state["current_profit"] += net_pnl
-                    if mode.upper() == "PAPER":
+                    if mode.lower() == "paper":
                         bot_state["current_balance"] += net_pnl
                 
                 active_position = None
                 last_trade_time = current_time
-                logger.info(f"🎯 Scalp Trade Closed: {outcome} | PnL: ${net_pnl:.2f}")
+                logger.info(f"🎯 Scalp Closed: {outcome} | PnL: ${net_pnl:.2f}")
         else:
             with state_lock:
                 bot_state["status_message"] = (
@@ -551,7 +555,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                 
                 if entry_qty > 0 and balance >= 10:
                     order = place_market_order(symbol, "BUY", entry_usd, mode)
-                    if order and ("orderId" in order or mode.upper() == "PAPER"):
+                    if order and ("orderId" in order or mode.lower() == "paper"):
                         entry_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         layers = [{
                             "layer": 1,
@@ -580,7 +584,7 @@ def process_bot_logic(symbol, mode, risk_pct):
 # 🔄 WORKER THREAD
 # ============================================
 def bot_worker():
-    logger.info("🚀 Scalper Worker Started!")
+    logger.info("🚀 Background Market Worker Started!")
     loop_count = 0
     while True:
         try:
@@ -588,10 +592,9 @@ def bot_worker():
                 symbol = bot_state["symbol"]
                 mode = bot_state["mode"]
                 risk_pct = bot_state["risk_pct"]
-                is_running = bot_state["is_running"]
             
-            if is_running:
-                process_bot_logic(symbol, mode, risk_pct)
+            # Always fetch data so chart & indicators are live!
+            process_bot_logic(symbol, mode, risk_pct)
             
             loop_count += 1
             if loop_count % 30 == 0:
@@ -602,7 +605,7 @@ def bot_worker():
             logger.error(traceback.format_exc())
             time.sleep(5)
         
-        time.sleep(5)
+        time.sleep(4)
 
 def start_worker_safely():
     global worker_thread
@@ -610,7 +613,7 @@ def start_worker_safely():
         if worker_thread is None or not worker_thread.is_alive():
             worker_thread = threading.Thread(target=bot_worker, daemon=True)
             worker_thread.start()
-            logger.info("🚀 Background Worker Thread (Re)started Successfully!")
+            logger.info("🚀 Worker Thread (Re)started Successfully!")
 
 init_db()
 load_db_history()
@@ -632,12 +635,14 @@ def start_bot():
     start_worker_safely()
     data = request.json or {}
     with state_lock:
-        mode_val = data.get("mode", "PAPER").upper()
+        mode_val = data.get("mode", "paper").lower()
         bot_state["mode"] = mode_val
         bot_state["trading_mode"] = mode_val
+        bot_state["trade_mode"] = mode_val
+        bot_state["mode_type"] = mode_val.upper()
         bot_state["symbol"] = data.get("symbol", "ETHUSDT")
         bot_state["risk_pct"] = float(data.get("risk_pct", 10.0))
-        if mode_val == "PAPER":
+        if mode_val == "paper":
             init_bal = float(data.get("start_balance", 1000.0))
             bot_state["virtual_balance"] = init_bal
             bot_state["current_balance"] = init_bal
@@ -700,7 +705,7 @@ def get_status():
                 "sl_price": active_position["sl_price"],
                 "unrealized_pnl": round(unrealized_pnl, 2)
             }
-            if bot_state["mode"] == "PAPER":
+            if bot_state["mode"] == "paper":
                 available_balance = max(0, bot_state["current_balance"] - active_position["total_cost"])
         
         win_rate = 0
@@ -711,6 +716,8 @@ def get_status():
             "is_running": bot_state["is_running"],
             "mode": bot_state["mode"],
             "trading_mode": bot_state["trading_mode"],
+            "trade_mode": bot_state["trade_mode"],
+            "mode_type": bot_state["mode_type"],
             "symbol": bot_state["symbol"],
             "risk_pct": bot_state["risk_pct"],
             "max_layers": 3,
