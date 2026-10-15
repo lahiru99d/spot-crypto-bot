@@ -37,7 +37,7 @@ BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 
 DB_FILE = "bot_memory.db"
-TRADE_COOLDOWN_SECONDS = 10
+TRADE_COOLDOWN_SECONDS = 15
 TIMEFRAME = "3m"
 
 app = Flask(__name__)
@@ -47,9 +47,9 @@ app = Flask(__name__)
 # ============================================
 bot_state = {
     "is_running": False,
-    "mode": "paper",
-    "trading_mode": "paper",
-    "trade_mode": "paper",
+    "mode": "PAPER",
+    "trading_mode": "PAPER",
+    "trade_mode": "PAPER",
     "tradingMode": "PAPER",
     "tradeMode": "PAPER",
     "mode_type": "PAPER",
@@ -57,12 +57,12 @@ bot_state = {
     "symbol": "ETHUSDT",
     "leverage": 1,
     "risk_pct": 10.0,
-    "max_layers": 3,
-    "total_layers": 3,
+    "max_layers": 2,  # Strictly limited to 2 Layers
+    "total_layers": 2,
     "virtual_balance": 1000.0,
     "current_balance": 1000.0,
     "current_price": 0.0,
-    "status_message": "Market Data සම්බන්ධ වෙමින් පවතී...",
+    "status_message": "Safe Scalper Bot සූදානම්ව පවතී...",
     
     # Trade metrics
     "wins": 0,
@@ -158,13 +158,29 @@ def load_db_history():
         history_trades = []
         for row in rows:
             timestamp, symbol, side, entry_price, exit_price, layers, tp, sl, pnl, outcome = row
+            # Provide ALL key aliases so frontend table never shows $undefined!
             history_trades.append({
                 "time": timestamp,
+                "timestamp": timestamp,
                 "type": f"{side}",
-                "entry": entry_price,
-                "exit": exit_price,
-                "pnl": pnl,
-                "status": outcome
+                "side": f"{side}",
+                "layers": layers,
+                "entry": round(entry_price, 2) if entry_price else 0.0,
+                "entry_price": round(entry_price, 2) if entry_price else 0.0,
+                "entryPrice": round(entry_price, 2) if entry_price else 0.0,
+                "cost": round(entry_price, 2) if entry_price else 0.0,
+                "exit": round(exit_price, 2) if exit_price else 0.0,
+                "exit_price": round(exit_price, 2) if exit_price else 0.0,
+                "tp": round(tp, 2) if tp else 0.0,
+                "take_profit": round(tp, 2) if tp else 0.0,
+                "tp_price": round(tp, 2) if tp else 0.0,
+                "sl": round(sl, 2) if sl else 0.0,
+                "emergency_sl": round(sl, 2) if sl else 0.0,
+                "stop_loss": round(sl, 2) if sl else 0.0,
+                "sl_price": round(sl, 2) if sl else 0.0,
+                "pnl": round(pnl, 2) if pnl else 0.0,
+                "status": outcome,
+                "outcome": outcome
             })
 
         tot_trades = total_count if total_count else 0
@@ -199,12 +215,12 @@ def save_trade_to_db(entry_time, exit_time, symbol, side, entry_price, exit_pric
         conn.commit()
         conn.close()
         load_db_history()
-        logger.info(f"💾 Trade Logged: {outcome} | PnL: ${pnl:.2f}")
+        logger.info(f"💾 Trade Saved: {outcome} | PnL: ${pnl:.2f}")
     except Exception as e:
         logger.error(f"❌ Save trade error: {e}")
 
 # ============================================
-# 🎯 QUICK SCALPING INDICATOR ENGINE
+# 🎯 REFINED ENTRY FILTER (PREVENT FALLING KNIFE)
 # ============================================
 def get_technical_signal(ind):
     price = ind["current_price"]
@@ -217,39 +233,37 @@ def get_technical_signal(ind):
     macd_bullish = macd > macd_signal
     macd_hist = macd - macd_signal
 
-    # 1. Dip bounce (oversold recovery)
-    if (32 <= rsi <= 50) and (macd_bullish or macd_hist > -0.4):
+    # 1. Genuine Dip Reversal (RSI oversold curl with MACD turning green)
+    if (30 <= rsi <= 45) and macd_bullish and macd_hist > 0:
         return "LONG", 80.0
 
-    # 2. Trend momentum
-    if (price >= ema20 * 0.998) and (ema20 >= ema50) and macd_bullish and (45 <= rsi <= 68):
+    # 2. Trend Momentum Scalp (Above EMA 20 with good support)
+    if (price >= ema20 * 0.999) and (ema20 >= ema50) and macd_bullish and (45 <= rsi <= 65):
         return "LONG", 75.0
 
-    # 3. Oversold bounce
-    if rsi < 35:
+    # 3. Deep Oversold Rebound
+    if rsi < 30 and macd_hist > -0.2:
         return "LONG", 70.0
 
-    if rsi > 70 or (not macd_bullish and rsi < 32):
+    # Strong bearish or dump -> Don't enter!
+    if rsi > 68 or (not macd_bullish and rsi < 35):
         return "SHORT", 60.0
 
     return "NEUTRAL", 50.0
 
 # ============================================
-# 📊 SAFE BINANCE FETCHER (GEO-RESTRICTION FIX)
+# 📊 SAFE BINANCE FETCHER
 # ============================================
 def get_klines_and_indicators(symbol):
-    # api.binance.us comes FIRST so Render (US server) never gets blocked!
     endpoints = [
         "https://api.binance.us/api/v3/klines",
         "https://api.binance.com/api/v3/klines",
         "https://api1.binance.com/api/v3/klines",
-        "https://api2.binance.com/api/v3/klines",
-        "https://api3.binance.com/api/v3/klines",
         "https://data-api.binance.vision/api/v3/klines"
     ]
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
     
     data = None
@@ -263,8 +277,6 @@ def get_klines_and_indicators(symbol):
                 if isinstance(raw, list) and len(raw) >= 50:
                     data = raw
                     break
-            else:
-                logger.warning(f"⚠️ {url} returned status {res.status_code}")
         except Exception:
             continue
 
@@ -348,7 +360,7 @@ def get_klines_and_indicators(symbol):
         return None, None
 
 # ============================================
-# 💹 FAST SCALP DCA & TAKE PROFIT
+# 💹 2-LAYER DCA & PROFITABLE TAKE PROFIT
 # ============================================
 def calculate_dca_levels(layers):
     if not layers:
@@ -357,15 +369,14 @@ def calculate_dca_levels(layers):
     total_cost = sum(l["cost"] for l in layers)
     avg_price = total_cost / total_qty if total_qty > 0 else 0.0
 
+    # REAL PROFIT TARGETS (Exceeds 0.2% fee easily!)
     if len(layers) == 1:
-        tp_ratio = 1.006  # +0.6% Fast scalp TP
-        sl_ratio = 0.982  # -1.8% SL
-    elif len(layers) == 2:
-        tp_ratio = 1.004  # +0.4% Average out
-        sl_ratio = 0.978  # -2.2%
+        tp_ratio = 1.008  # +0.8% Take Profit (Clean net profit after fee)
+        sl_ratio = 0.980  # -2.0% Stop Loss
     else:
-        tp_ratio = 1.003  # +0.3%
-        sl_ratio = 0.975  # -2.5%
+        # Layer 2 (Final Layer)
+        tp_ratio = 1.005  # +0.5% Average-out profit
+        sl_ratio = 0.975  # -2.5% Stop Loss
 
     return (round(avg_price, 4), round(total_qty, 4), round(total_cost, 2), 
             round(avg_price * tp_ratio, 4), round(avg_price * sl_ratio, 4))
@@ -423,7 +434,7 @@ def process_bot_logic(symbol, mode, risk_pct):
     tech_signal, tech_conf = get_technical_signal(ind)
     final_signal = tech_signal
     
-    # Live data update for UI
+    # State update
     with state_lock:
         bot_state["current_price"] = current_price
         bot_state["candles"] = candles
@@ -458,16 +469,10 @@ def process_bot_logic(symbol, mode, risk_pct):
         
         unrealized_pnl = (current_price - avg_price) * total_qty
         unrealized_pnl_pct = (unrealized_pnl / active_position["total_cost"]) * 100
-        
-        try:
-            entry_dt = datetime.strptime(active_position["entry_time"], "%Y-%m-%d %H:%M:%S")
-            trade_duration_minutes = (datetime.now() - entry_dt).total_seconds() / 60.0
-        except Exception:
-            trade_duration_minutes = 0
 
-        # DCA Layer Add
-        if len(layers) < 3 and current_price <= active_position["last_layer_price"] * 0.988:
-            if ind["rsi"] < 48:
+        # DCA Layer Add: STRICTLY MAX 2 LAYERS (Only 1 DCA layer allowed!)
+        if len(layers) < 2 and current_price <= active_position["last_layer_price"] * 0.985:
+            if ind["rsi"] < 40:  # Only average if genuinely oversold
                 with state_lock:
                     balance = bot_state["current_balance"]
                 
@@ -490,18 +495,20 @@ def process_bot_logic(symbol, mode, risk_pct):
                         "tp_price": tp_p, "sl_price": sl_p,
                         "last_layer_price": current_price
                     })
-                    logger.info(f"📈 DCA Layer {len(layers)} Executed @ ${current_price}")
+                    logger.info(f"📈 Final DCA Layer 2 Executed @ ${current_price}")
 
-        # Exit Checks
+        # PROFITABLE EXIT CHECKS
         exit_reason = None
+        
+        # 1. Main TP Hit (+0.8% or +0.5%)
         if current_price >= tp_price:
-            exit_reason = "SCALP_TP_HIT (+0.6%)"
+            exit_reason = "TAKE_PROFIT_HIT"
+        # 2. Hard Stop Loss Hit
         elif current_price <= sl_price:
             exit_reason = "SL_HIT"
-        elif unrealized_pnl_pct >= 0.3 and ind["rsi"] >= 65:
-            exit_reason = "MOMENTUM_EXIT"
-        elif trade_duration_minutes >= 45 and unrealized_pnl_pct >= 0.15:
-            exit_reason = "STALE_PROFIT_EXIT"
+        # 3. Dynamic Profit Exit: In solid profit (+0.5%+) and RSI is overbought (Reversal)
+        elif unrealized_pnl_pct >= 0.5 and ind["rsi"] >= 68:
+            exit_reason = "OVERBOUGHT_PROFIT_EXIT"
 
         if exit_reason:
             exit_price = current_price
@@ -535,15 +542,15 @@ def process_bot_logic(symbol, mode, risk_pct):
                 
                 active_position = None
                 last_trade_time = current_time
-                logger.info(f"🎯 Scalp Closed: {outcome} | PnL: ${net_pnl:.2f}")
+                logger.info(f"🎯 Position Closed: {outcome} | Net PnL: ${net_pnl:.2f}")
         else:
             with state_lock:
                 bot_state["status_message"] = (
-                    f"SCALP ({len(layers)}/3) | Avg: ${avg_price} | "
-                    f"TP: ${tp_price} (+0.6%) | SL: ${sl_price} | PnL: ${unrealized_pnl:.2f}"
+                    f"SCALP ({len(layers)}/2) | Avg: ${avg_price:.2f} | "
+                    f"TP: ${tp_price:.2f} | SL: ${sl_price:.2f} | PnL: ${unrealized_pnl:.2f}"
                 )
 
-    # ===== LOOK FOR SCALPING ENTRY =====
+    # ===== LOOK FOR ENTRY =====
     else:
         cooldown = TRADE_COOLDOWN_SECONDS
         if (current_time - last_trade_time) < cooldown:
@@ -553,7 +560,8 @@ def process_bot_logic(symbol, mode, risk_pct):
             with state_lock:
                 bot_state["status_message"] = f"Scanning... | Signal: {tech_signal} ({tech_conf:.0f}%) | RSI: {ind['rsi']}"
 
-            if final_signal == "LONG" and tech_conf >= 65:
+            # Only enter on strong setup
+            if final_signal == "LONG" and tech_conf >= 70:
                 with state_lock:
                     balance = bot_state["current_balance"]
                 
@@ -575,7 +583,7 @@ def process_bot_logic(symbol, mode, risk_pct):
                         active_position = {
                             "entry_time": entry_time,
                             "layers": layers,
-                            "max_layers": 3,
+                            "max_layers": 2,
                             "avg_price": avg_p,
                             "total_qty": tot_q,
                             "total_cost": tot_c,
@@ -585,13 +593,13 @@ def process_bot_logic(symbol, mode, risk_pct):
                             "ml_signal": final_signal,
                             "ml_conf": tech_conf
                         }
-                        logger.info(f"🚀 SCALP ENTRY OPENED @ ${current_price} | TP: ${tp_p}")
+                        logger.info(f"🚀 SCALP 1/2 OPENED @ ${current_price} | TP: ${tp_p}")
 
 # ============================================
 # 🔄 WORKER THREAD
 # ============================================
 def bot_worker():
-    logger.info("🚀 Background Market Worker Started!")
+    logger.info("🚀 Scalper Market Worker Started!")
     loop_count = 0
     while True:
         try:
@@ -642,9 +650,9 @@ def start_bot():
     data = request.json or {}
     with state_lock:
         mode_val = data.get("mode", "paper").lower()
-        bot_state["mode"] = mode_val
-        bot_state["trading_mode"] = mode_val
-        bot_state["trade_mode"] = mode_val
+        bot_state["mode"] = mode_val.upper()
+        bot_state["trading_mode"] = mode_val.upper()
+        bot_state["trade_mode"] = mode_val.upper()
         bot_state["tradingMode"] = mode_val.upper()
         bot_state["tradeMode"] = mode_val.upper()
         bot_state["mode_type"] = mode_val.upper()
@@ -706,15 +714,19 @@ def get_status():
             active_pos_data = {
                 "entry_time": active_position["entry_time"],
                 "layers": active_position["layers"],
-                "max_layers": 3,
-                "total_layers": 3,
-                "avg_price": active_position["avg_price"],
-                "total_qty": active_position["total_qty"],
-                "tp_price": active_position["tp_price"],
-                "sl_price": active_position["sl_price"],
+                "layers_count": len(active_position["layers"]),
+                "max_layers": 2,
+                "total_layers": 2,
+                "layers_max": 2,
+                "avg_price": round(active_position["avg_price"], 2),
+                "entry_price": round(active_position["avg_price"], 2),
+                "entryPrice": round(active_position["avg_price"], 2),
+                "total_qty": round(active_position["total_qty"], 4),
+                "tp_price": round(active_position["tp_price"], 2),
+                "sl_price": round(active_position["sl_price"], 2),
                 "unrealized_pnl": round(unrealized_pnl, 2)
             }
-            if bot_state["mode"] == "paper":
+            if bot_state["mode"].lower() == "paper":
                 available_balance = max(0, bot_state["current_balance"] - active_position["total_cost"])
         
         win_rate = 0
@@ -732,8 +744,9 @@ def get_status():
             "mode_name": bot_state["mode_name"],
             "symbol": bot_state["symbol"],
             "risk_pct": bot_state["risk_pct"],
-            "max_layers": 3,
-            "total_layers": 3,
+            "max_layers": 2,
+            "total_layers": 2,
+            "layers_max": 2,
             "balance": round(available_balance, 2),
             "current_profit": round(bot_state["current_profit"], 2),
             "total_trades": bot_state["total_trades"],
